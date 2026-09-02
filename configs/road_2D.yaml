@@ -1,6 +1,6 @@
 DATA:
   DIM: 2 # data dimension
-  BATCH_SIZE: 2
+  BATCH_SIZE: 20
   DATA_PATH: "./data/P&ID_imgs/PID2Graph/PID2Grpah-reducted" # Reduced patched P&ID dataset root
   DATASET: "patched-pid-2D"
   IMG_SIZE: [512, 512] # Input image size
@@ -15,9 +15,9 @@ MODEL:
     NAME: deformable_transformer_backbone
     HIDDEN_DIM: 256 #128 #256 #768
     POSITION_EMBEDDING: sine
-    LR_BACKBONE: 2e-5
+    LR_BACKBONE: 3e-5
     NUM_FEATURE_LEVELS: 4
-    BACKBONE: resnet50
+    BACKBONE: resnet101
     MASKS: False
     DILATION: False
 
@@ -44,7 +44,7 @@ MODEL:
     WITH_BOX_REFINE: False
     # RLN_TOKEN: True
 
-    OBJ_TOKEN: 192 # Maximum annotated P&ID nodes in a sample is 188
+    OBJ_TOKEN: 400
     RLN_TOKEN: 1
     DUMMY_TOKEN: 0
 
@@ -55,9 +55,9 @@ MODEL:
     C_NODE: 5
 
 TRAIN:
-  EPOCHS: 50
-  LR: 2e-4
-  LR_BACKBONE: 2e-5
+  EPOCHS: 80
+  LR: 1e-4
+  LR_BACKBONE: 3e-5
   WEIGHT_DECAY: 1e-4
   LR_DROP: 40
   CLIP_MAX_NORM: 0.1 # hardcoded
@@ -71,8 +71,9 @@ TRAIN:
   W_BBOX: 2.0
   W_CLASS: 2.0
   W_CARD: 1.0
-  W_NODE: 5.0
-  W_EDGE: 1.0
+  W_NODE: 4.0
+  W_EDGE: 3.0
+  RANDOMIZE_EDGE_DIRECTIONS: True
 
 INFERENCE:
   NODE_THRESHOLD: 0.60 # Keep only confident node predictions
