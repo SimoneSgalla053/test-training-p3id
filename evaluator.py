@@ -1,5 +1,8 @@
 import os
 import gc
+from pathlib import Path
+import matplotlib.pyplot as plt
+import numpy as np
 import torch
 from monai.engines import SupervisedEvaluator
 from monai.handlers import StatsHandler, CheckpointSaver, TensorBoardStatsHandler
@@ -12,7 +15,6 @@ from monai.transforms import (
 from multiprocessing import Pool
 import pdb
 from inference import relation_infer
-from utils import save_input, save_output
 
 from torch.utils.data import DataLoader
 from typing import TYPE_CHECKING, Callable, Dict, Iterable, List, Optional, Sequence, Tuple, Union
@@ -22,13 +24,21 @@ from monai.engines.utils import default_metric_cmp_fn, default_prepare_batch
 from monai.inferers import Inferer, SimpleInferer
 from monai.transforms import Transform
 from monai.utils import ForwardMode, min_version, optional_import
+
 if TYPE_CHECKING:
     from ignite.engine import Engine, EventEnum
     from ignite.metrics import Metric
 else:
-    Engine, _ = optional_import("ignite.engine", IgniteInfo.OPT_IMPORT_VERSION, min_version, "Engine")
-    Metric, _ = optional_import("ignite.metrics", IgniteInfo.OPT_IMPORT_VERSION, min_version, "Metric")
-    EventEnum, _ = optional_import("ignite.engine", IgniteInfo.OPT_IMPORT_VERSION, min_version, "EventEnum")
+    Engine, _ = optional_import(
+        "ignite.engine", IgniteInfo.OPT_IMPORT_VERSION, min_version, "Engine"
+    )
+    Metric, _ = optional_import(
+        "ignite.metrics", IgniteInfo.OPT_IMPORT_VERSION, min_version, "Metric"
+    )
+    EventEnum, _ = optional_import(
+        "ignite.engine", IgniteInfo.OPT_IMPORT_VERSION, min_version, "EventEnum"
+    )
+
 
 # Define customized evaluator
 class RelationformerEvaluator(SupervisedEvaluator):
@@ -71,29 +81,50 @@ class RelationformerEvaluator(SupervisedEvaluator):
             event_names=event_names,
             event_to_attr=event_to_attr,
             decollate=decollate,
-            network = network,
-            inferer = SimpleInferer() if inferer is None else inferer
+            network=network,
+            inferer=SimpleInferer() if inferer is None else inferer,
         )
 
-        self.config = kwargs.pop('config')
-        
+        self.config = kwargs.pop("config")
+        self.last_visualization_epoch = None
+
     def _iteration(self, engine, batchdata):
         images, nodes, edges = batchdata[0], batchdata[1], batchdata[2]
-        
+
         # # inputs, targets = self.get_batch(batchdata, image_keys=IMAGE_KEYS, label_keys="label")
         # # inputs = torch.cat(inputs, 1)
-        images = images.to(engine.state.device,  non_blocking=False)
-        nodes = [node.to(engine.state.device,  non_blocking=False) for node in nodes]
-        edges = [edge.to(engine.state.device,  non_blocking=False) for edge in edges]
+        images = images.to(engine.state.device, non_blocking=False)
+        nodes = [node.to(engine.state.device, non_blocking=False) for node in nodes]
+        edges = [edge.to(engine.state.device, non_blocking=False) for edge in edges]
 
         self.network.eval()
-        
+
         h, out = self.network(images)
 
         pred_nodes, pred_edges = relation_infer(
-            h.detach(), out, self.network, self.config.MODEL.DECODER.OBJ_TOKEN, self.config.MODEL.DECODER.RLN_TOKEN
+            h.detach(),
+            out,
+            self.network,
+            self.config.MODEL.DECODER.OBJ_TOKEN,
+            self.config.MODEL.DECODER.RLN_TOKEN,
+            node_threshold=self.config.INFERENCE.NODE_THRESHOLD,
+            edge_threshold=self.config.INFERENCE.EDGE_THRESHOLD,
         )
-        
+
+        if self.config.TRAIN.SAVE_VAL and self.last_visualization_epoch != engine.state.epoch:
+            save_graph_comparison(
+                images[0],
+                nodes[0],
+                edges[0],
+                pred_nodes[0],
+                pred_edges[0],
+                Path(self.config.TRAIN.SAVE_PATH)
+                / "results"
+                / "validation"
+                / f"epoch_{engine.state.epoch:03d}.png",
+            )
+            self.last_visualization_epoch = engine.state.epoch
+
         # if self.config.TRAIN.SAVE_VAL:
         #     root_path = os.path.join(self.config.TRAIN.SAVE_PATH, "runs", '%s_%d' % (self.config.log.exp_name, self.config.DATA.SEED), 'val_samples')
         #     if not os.path.exists(root_path):
@@ -106,8 +137,14 @@ class RelationformerEvaluator(SupervisedEvaluator):
 
         gc.collect()
         torch.cuda.empty_cache()
-        
-        return {"images": images, "nodes": nodes, "edges": edges, "pred_nodes":pred_nodes, "pred_edges":pred_edges}
+
+        return {
+            "images": images,
+            "nodes": nodes,
+            "edges": edges,
+            "pred_nodes": pred_nodes,
+            "pred_edges": pred_edges,
+        }
 
 
 def build_evaluator(val_loader, net, optimizer, scheduler, writer, config, device):
@@ -124,18 +161,23 @@ def build_evaluator(val_loader, net, optimizer, scheduler, writer, config, devic
     val_handlers = [
         StatsHandler(output_transform=lambda x: None),
         CheckpointSaver(
-            save_dir=os.path.join(config.TRAIN.SAVE_PATH, "runs", '%s_%d' % (config.log.exp_name, config.DATA.SEED), 'models'),
+            save_dir=os.path.join(
+                config.TRAIN.SAVE_PATH,
+                "runs",
+                "%s_%d" % (config.log.exp_name, config.DATA.SEED),
+                "models",
+            ),
             save_dict={"net": net, "optimizer": optimizer, "scheduler": scheduler},
             save_key_metric=True,
             key_metric_n_saved=5,
             save_interval=1,
-            key_metric_negative_sign=True
+            key_metric_negative_sign=True,
         ),
         TensorBoardStatsHandler(
             writer,
             tag_name="val_smd",
             output_transform=lambda x: None,
-            global_epoch_transform=lambda x: scheduler.last_epoch
+            global_epoch_transform=lambda x: scheduler.last_epoch,
         ),
     ]
 
@@ -147,7 +189,7 @@ def build_evaluator(val_loader, net, optimizer, scheduler, writer, config, devic
     # )
 
     evaluator = RelationformerEvaluator(
-        config= config,
+        config=config,
         device=device,
         val_data_loader=val_loader,
         network=net,
@@ -155,7 +197,12 @@ def build_evaluator(val_loader, net, optimizer, scheduler, writer, config, devic
         # post_transform=val_post_transform,
         key_val_metric={
             "val_smd": MeanSMD(
-                output_transform=lambda x: (x["nodes"], x["edges"], x["pred_nodes"], x["pred_edges"]),
+                output_transform=lambda x: (
+                    x["nodes"],
+                    x["edges"],
+                    x["pred_nodes"],
+                    x["pred_edges"],
+                ),
             )
         },
         val_handlers=val_handlers,
@@ -163,3 +210,44 @@ def build_evaluator(val_loader, net, optimizer, scheduler, writer, config, devic
     )
 
     return evaluator
+
+
+def save_graph_comparison(
+    image, target_nodes, target_edges, predicted_nodes, predicted_edges, output_path
+):
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    image = to_numpy(image[0])
+    target_nodes, target_edges = to_numpy(target_nodes), to_numpy(target_edges)
+    predicted_nodes, predicted_edges = to_numpy(predicted_nodes), to_numpy(predicted_edges)
+
+    figure, axes = plt.subplots(1, 3, figsize=(15, 5), dpi=150)
+    axes[0].imshow(image, cmap="gray")
+    axes[0].set_title("Input")
+    for axis, title, nodes, edges in (
+        (axes[1], "Ground truth", target_nodes, target_edges),
+        (axes[2], "Prediction", predicted_nodes, predicted_edges),
+    ):
+        axis.imshow(image, cmap="gray")
+        for source, target in edges:
+            axis.plot(
+                [nodes[source, 0] * image.shape[1], nodes[target, 0] * image.shape[1]],
+                [nodes[source, 1] * image.shape[0], nodes[target, 1] * image.shape[0]],
+                color="tab:orange",
+                linewidth=1,
+            )
+        if len(nodes):
+            axis.scatter(
+                nodes[:, 0] * image.shape[1], nodes[:, 1] * image.shape[0], s=8, c="tab:red"
+            )
+        axis.set_title(title)
+    for axis in axes:
+        axis.axis("off")
+    figure.tight_layout()
+    figure.savefig(output_path, bbox_inches="tight")
+    plt.close(figure)
+
+
+def to_numpy(value):
+    if isinstance(value, torch.Tensor):
+        return value.detach().cpu().numpy()
+    return np.asarray(value)

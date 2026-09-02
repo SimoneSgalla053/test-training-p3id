@@ -1,14 +1,14 @@
 DATA:
-  DIM: 2                  # data dimension
-  BATCH_SIZE: 64 #16
-  DATA_PATH: './data/toulouse-road-network'        # Path to dataset, could be overwritten by command line argument
-  DATASET: 'toulouse-road-network-2D'     # Dataset name
-  IMG_SIZE: [64, 64]  # Input image size
-  NUM_WORKERS: 0          # Number of data loading threads
-  SEED: 10                # random seed for reproducibility
+  DIM: 2 # data dimension
+  BATCH_SIZE: 2
+  DATA_PATH: "./data/P&ID_imgs/PID2Graph/PID2Grpah-reducted" # Reduced patched P&ID dataset root
+  DATASET: "patched-pid-2D"
+  IMG_SIZE: [512, 512] # Input image size
+  NUM_WORKERS: 4 # Number of data loading threads
+  SEED: 10 # random seed for reproducibility
 
 MODEL:
-  NUM_CLASSES: 2          # Number of classes, overwritten in data preparation
+  NUM_CLASSES: 2 # Number of classes, overwritten in data preparation
 
   ENCODER:
     TYPE: deformable_transformer_backbone
@@ -33,8 +33,8 @@ MODEL:
     ENC_LAYERS: 4 #4 #2
     DEC_LAYERS: 4 #4 #2
     DIM_FEEDFORWARD: 512 #128 #512 #2048
-    DROPOUT: 0.1  # 0.0
-    ACTIVATION: relu  
+    DROPOUT: 0.1 # 0.0
+    ACTIVATION: relu
     NUM_FEATURE_LEVELS: 4
     DEC_N_POINTS: 4
     ENC_N_POINTS: 4
@@ -44,7 +44,7 @@ MODEL:
     WITH_BOX_REFINE: False
     # RLN_TOKEN: True
 
-    OBJ_TOKEN: 20
+    OBJ_TOKEN: 192 # Maximum annotated P&ID nodes in a sample is 188
     RLN_TOKEN: 1
     DUMMY_TOKEN: 0
 
@@ -60,20 +60,24 @@ TRAIN:
   LR_BACKBONE: 2e-5
   WEIGHT_DECAY: 1e-4
   LR_DROP: 40
-  CLIP_MAX_NORM: 0.1  # hardcoded
+  CLIP_MAX_NORM: 0.1 # hardcoded
 
-  SAVE_PATH: "./trained_weights/"       # save path for the checkpoint, log and val results
-  VAL_INTERVAL: 1                  # validation interval
-  SAVE_VAL: True                   # save validation data
+  SAVE_PATH: "./trained_weights/" # save path for the checkpoint, log and val results
+  VAL_INTERVAL: 1 # validation interval
+  SAVE_VAL: True # save validation data
 
   # loss weight
-  LOSSES: ['boxes', 'class', 'cards', 'nodes', 'edges']
+  LOSSES: ["boxes", "class", "cards", "nodes", "edges"]
   W_BBOX: 2.0
   W_CLASS: 2.0
   W_CARD: 1.0
   W_NODE: 5.0
   W_EDGE: 1.0
 
+INFERENCE:
+  NODE_THRESHOLD: 0.60 # Keep only confident node predictions
+  EDGE_THRESHOLD: 0.75 # Suppress low-confidence edges between predicted nodes
+
 log:
-  exp_name: 'experiment0'
-  message: "Baseline 2D relationformer for 2D road network"
+  exp_name: "pid_reduced"
+  message: "Relationformer for the reduced patched P&ID line graph dataset"

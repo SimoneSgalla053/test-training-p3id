@@ -10,15 +10,17 @@ import pickle
 import random
 import yaml
 import json
+import hashlib
+from pathlib import Path
+from xml.etree import ElementTree
 
 
 class ToulouseRoadNetworkDataset(Dataset):
     """
     Generates a subclass of the PyTorch torch.utils.data.Dataset class
     """
-    def __init__(
-        self, root_path="data/", split="valid", use_raw_images=False
-    ):
+
+    def __init__(self, root_path="data/", split="valid", use_raw_images=False):
         """
         :param root_path: root data path
         :param split: data split in {"train", "valid", "test", "augment"}
@@ -31,34 +33,33 @@ class ToulouseRoadNetworkDataset(Dataset):
         assert split in {"train", "valid", "test", "augment"}
         print(f"Started loading the data ({split})...")
         start_time = time.time()
-        
+
         dataset_path = f"{root_path}/{split}.pickle"
         images_path = f"{root_path}/{split}_images.pickle"
         images_raw_path = f"{root_path}/{split}/images/"
-        
+
         ids, list_nodes, list_edges = load_dataset(dataset_path)
-        
+
         self.ids = ["{:0>7d}".format(int(i)) for i in ids]
         self.nodes = list_nodes
         self.edges = list_edges
 
-        
         print(f"Started loading the images...")
-        
+
         if use_raw_images:
             self.images = load_raw_images(ids, images_raw_path)
         else:
             self.images = load_images(ids, images_path)
-        
+
         print(f"Dataset loading completed, took {round(time.time() - start_time, 2)} seconds!")
         print(f"Dataset size: {len(self)}\n")
-    
+
     def __len__(self):
         r"""
         :return: data length
         """
         return len(self.ids)
-    
+
     def __getitem__(self, idx):
         r"""
         :param idx: index in the data
@@ -67,10 +68,136 @@ class ToulouseRoadNetworkDataset(Dataset):
         return self.images[idx][None], self.nodes[idx], self.edges[idx], self.ids[idx]
 
 
+class PatchedPIDDataset(Dataset):
+    """Loads patched P&ID PNG images and their paired GraphML annotations."""
+
+    SPLIT_RANGES = {
+        "train": (0, 80),
+        "valid": (80, 90),
+        "test": (90, 100),
+    }
+
+    def __init__(self, root_path, split="train", image_size=(512, 512), split_seed=10):
+        if split not in self.SPLIT_RANGES:
+            raise ValueError(f"Unsupported P&ID split: {split}")
+
+        root = Path(root_path)
+        if not root.is_dir():
+            raise FileNotFoundError(f"P&ID dataset directory does not exist: {root}")
+
+        split_start, split_end = self.SPLIT_RANGES[split]
+        self.image_size = tuple(image_size)
+        self.samples = []
+        skipped_graphs = 0
+        for graph_path in sorted(root.rglob("*.graphml")):
+            image_path = graph_path.with_suffix(".png")
+            if not image_path.is_file():
+                continue
+
+            group = graph_path.parent.relative_to(root).as_posix()
+            split_value = int(hashlib.sha1(f"{split_seed}:{group}".encode()).hexdigest(), 16) % 100
+            if split_start <= split_value < split_end:
+                if not is_trainable_pid_graph(graph_path):
+                    skipped_graphs += 1
+                    continue
+                self.samples.append(
+                    (
+                        image_path,
+                        graph_path,
+                        graph_path.relative_to(root).with_suffix("").as_posix(),
+                    )
+                )
+
+        if not self.samples:
+            raise RuntimeError(f"No paired P&ID samples found for the {split} split under {root}")
+
+        print(
+            f"Loaded {len(self.samples)} P&ID samples for {split} ({skipped_graphs} unusable graphs skipped)."
+        )
+
+    def __len__(self):
+        return len(self.samples)
+
+    def __getitem__(self, idx):
+        image_path, graph_path, sample_id = self.samples[idx]
+        image = Image.open(image_path).convert("L").resize(self.image_size, Image.BILINEAR)
+        image = tvf.to_tensor(image)
+        nodes, edges = load_pid_graph(graph_path, image_path)
+        return image[None], nodes, edges, sample_id
+
+
+def load_pid_graph(graph_path, image_path):
+    """Converts GraphML bounding boxes to normalized node centers and edge indices."""
+    with Image.open(image_path) as image:
+        width, height = image.size
+
+    namespace = "{http://graphml.graphdrawing.org/xmlns}"
+    graph = ElementTree.parse(graph_path).getroot().find(f"{namespace}graph")
+    node_indices = {}
+    node_centers = []
+    for node in graph.findall(f"{namespace}node"):
+        attributes = {data.get("key"): data.text for data in node.findall(f"{namespace}data")}
+        xmin = attributes.get("d1", attributes.get("d5"))
+        ymin = attributes.get("d2", attributes.get("d6"))
+        xmax = attributes.get("d3", attributes.get("d7"))
+        ymax = attributes.get("d4", attributes.get("d8"))
+        if None in (xmin, ymin, xmax, ymax):
+            raise ValueError(f"Node {node.get('id')} in {graph_path} has no bounding box")
+
+        node_indices[node.get("id")] = len(node_centers)
+        node_centers.append(
+            ((float(xmin) + float(xmax)) / (2 * width), (float(ymin) + float(ymax)) / (2 * height))
+        )
+
+    edge_indices = []
+    for edge in graph.findall(f"{namespace}edge"):
+        source, target = edge.get("source"), edge.get("target")
+        if source in node_indices and target in node_indices and source != target:
+            edge_indices.append((node_indices[source], node_indices[target]))
+
+    if not edge_indices:
+        raise ValueError(f"Graph {graph_path} has no usable edges")
+    return torch.tensor(node_centers, dtype=torch.float32), torch.tensor(
+        edge_indices, dtype=torch.long
+    )
+
+
+def is_trainable_pid_graph(graph_path):
+    namespace = "{http://graphml.graphdrawing.org/xmlns}"
+    graph = ElementTree.parse(graph_path).getroot().find(f"{namespace}graph")
+    node_ids = set()
+    for node in graph.findall(f"{namespace}node"):
+        attributes = {data.get("key"): data.text for data in node.findall(f"{namespace}data")}
+        bounding_box = (
+            attributes.get("d1", attributes.get("d5")),
+            attributes.get("d2", attributes.get("d6")),
+            attributes.get("d3", attributes.get("d7")),
+            attributes.get("d4", attributes.get("d8")),
+        )
+        if None in bounding_box:
+            return False
+        node_ids.add(node.get("id"))
+
+    return any(
+        edge.get("source") in node_ids
+        and edge.get("target") in node_ids
+        and edge.get("source") != edge.get("target")
+        for edge in graph.findall(f"{namespace}edge")
+    )
+
+
+def image_graph_collate_road_network(batch):
+    images = torch.cat([item[0] for item in batch], 0).contiguous()
+    nodes = [item[1] for item in batch]
+    edges = [item[2] for item in batch]
+    ids = [item[3] for item in batch]
+    return [images, nodes, edges, ids]
+
+
 def load_dataset(dataset_path):
     """
     Loads the chosen split of the data
-    
+
     :param dataset_path: path of the data split pickle
     :param max_prev_node: only return the last previous 'max_prev_node' elements in the adjacency row of a node
     :param return_coordinates: returns coordinates on the real map for each datapoint
@@ -78,18 +205,20 @@ def load_dataset(dataset_path):
     """
     with open(dataset_path, "rb") as pickled_file:
         dataset = pickle.load(pickled_file)
-    
+
     list_nodes = []
     list_edges = []
     ids = list(dataset.keys())
-    random.Random(42).shuffle(ids)  # permute to remove any correlation between consecutive datapoints
-    
+    random.Random(42).shuffle(
+        ids
+    )  # permute to remove any correlation between consecutive datapoints
+
     for id in ids:
         datapoint = dataset[id]
 
         # Retrieve from dataset
-        nodes = (torch.FloatTensor(datapoint['nodes']) + 1) / 2
-        edges = torch.tensor((datapoint['edges']))[:, :2]
+        nodes = (torch.FloatTensor(datapoint["nodes"]) + 1) / 2
+        edges = torch.tensor((datapoint["edges"]))[:, :2]
 
         # Sort edges
         edges_sorted = torch.sort(edges, 1)[0]
@@ -99,7 +228,7 @@ def load_dataset(dataset_path):
         edges_clean = torch.unique(edges_sorted, dim=0)
         participating_nodes = torch.unique(edges_clean)
 
-        for node in torch.arange(nodes.shape[0]-1, -1, -1):
+        for node in torch.arange(nodes.shape[0] - 1, -1, -1):
             if node not in participating_nodes:
                 edges_clean[edges_clean > node] -= 1
 
@@ -107,13 +236,14 @@ def load_dataset(dataset_path):
 
         list_nodes.append(nodes_clean)
         list_edges.append(edges_clean)
-        
+
     return ids, list_nodes, list_edges
+
 
 def load_images(ids, images_path):
     """
     Load images from arrays in pickle files
-    
+
     :param ids: ids of the images in the data order
     :param images_path: path of the pickle file
     :return: the images, as pytorch tensors
@@ -126,13 +256,14 @@ def load_images(ids, images_path):
         assert img.shape[1] == img.shape[2]
         assert img.shape[1] in {64}
         images.append(img)
-    
+
     return images
+
 
 def load_raw_images(ids, images_path):
     """
     Load images from raw files
-    
+
     :param ids: ids of the images in the data order
     :param images_path: path of the raw images
     :return: the images, as pytorch tensors
@@ -142,7 +273,7 @@ def load_raw_images(ids, images_path):
         # if count % 10000 == 0:
         #     print(count)
         image_path = images_path + "{:0>7d}".format(int(id)) + ".png"
-        img = Image.open(image_path).convert('L')
+        img = Image.open(image_path).convert("L")
         img = tvf.to_tensor(img)
         assert img.shape[1] == img.shape[2]
         assert img.shape[1] in {64, 128}
@@ -150,24 +281,32 @@ def load_raw_images(ids, images_path):
     return images
 
 
-def build_road_network_data(config, mode='split'):
-    if mode == 'split':
-        train_ds = ToulouseRoadNetworkDataset(
-            root_path=config.DATA.DATA_PATH, split='train'
-        )
-        val_ds = ToulouseRoadNetworkDataset(
-            root_path=config.DATA.DATA_PATH, split='valid'
-        )
+def build_road_network_data(config, mode="split"):
+    if config.DATA.DATASET == "patched-pid-2D":
+        dataset_kwargs = {
+            "root_path": config.DATA.DATA_PATH,
+            "image_size": config.DATA.IMG_SIZE,
+            "split_seed": config.DATA.SEED,
+        }
+        if mode == "split":
+            return PatchedPIDDataset(split="train", **dataset_kwargs), PatchedPIDDataset(
+                split="valid", **dataset_kwargs
+            )
+        if mode == "test":
+            return PatchedPIDDataset(split="test", **dataset_kwargs)
+        raise ValueError(f"Unsupported data build mode: {mode}")
+
+    if mode == "split":
+        train_ds = ToulouseRoadNetworkDataset(root_path=config.DATA.DATA_PATH, split="train")
+        val_ds = ToulouseRoadNetworkDataset(root_path=config.DATA.DATA_PATH, split="valid")
 
         return train_ds, val_ds
-    elif mode == 'test':
-        test_ds = ToulouseRoadNetworkDataset(
-            root_path=config.DATA.DATA_PATH, split='test'
-        )
+    elif mode == "test":
+        test_ds = ToulouseRoadNetworkDataset(root_path=config.DATA.DATA_PATH, split="test")
         return test_ds
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     import cv2
     import numpy as np
     from torch.utils.data import DataLoader
@@ -176,18 +315,18 @@ if __name__ == '__main__':
     def custom_collate_fn(batch):
         """
         Custom collate function ordering the element in a batch by descending length
-        
+
         :param batch: batch from pytorch dataloader
         :return: the ordered batch
         """
         x_adj, x_coord, y_adj, y_coord, img, seq_len, ids = zip(*batch)
-        
+
         x_adj = pad_sequence(x_adj, batch_first=True, padding_value=0)
         x_coord = pad_sequence(x_coord, batch_first=True, padding_value=0)
         y_adj = pad_sequence(y_adj, batch_first=True, padding_value=0)
         y_coord = pad_sequence(y_coord, batch_first=True, padding_value=0)
         img, seq_len = torch.stack(img), torch.stack(seq_len)
-        
+
         seq_len, perm_index = seq_len.sort(0, descending=True)
         x_adj = x_adj[perm_index]
         x_coord = x_coord[perm_index]
@@ -195,7 +334,7 @@ if __name__ == '__main__':
         y_coord = y_coord[perm_index]
         img = img[perm_index]
         ids = [ids[perm_index[i]] for i in range(perm_index.shape[0])]
-        
+
         return x_adj, x_coord, y_adj, y_coord, img, seq_len, ids
 
     class obj:
@@ -204,28 +343,27 @@ if __name__ == '__main__':
 
     def dict2obj(dict1):
         return json.loads(json.dumps(dict1), object_hook=obj)
-    
+
     config = "configs/road_2D_deform_detr.yaml"
     with open(config) as f:
         config = yaml.load(f, Loader=yaml.FullLoader)
     config = dict2obj(config)
 
-    train_ds, val_ds = build_road_network_data(config, mode='split')
+    train_ds, val_ds = build_road_network_data(config, mode="split")
     # dataloader = DataLoader(train_ds, batch_size=16, shuffle=False, collate_fn=custom_collate_fn)
 
     for i in [14, 2, 4, 6, 30, 26, 43, 24, 69173, 48360, 60201]:
-        ret = train_ds[i]   # some strange cases 14, 2, 4, 6, 30, 26, 43, 24
+        ret = train_ds[i]  # some strange cases 14, 2, 4, 6, 30, 26, 43, 24
         print(ret[-1])
 
         nodes_pixels = (ret[1] * ret[0].shape[-1]).type(torch.int32).numpy()
 
         image = ret[0].squeeze().cpu().numpy()
         image = np.flip(image, 0).copy()
-        
+
         for node in nodes_pixels:
             image = cv2.circle(image, node, 5, (0, 0, 0), 2)
-            cv2.imshow('testing', image)
+            cv2.imshow("testing", image)
             cv2.waitKey()
 
         print(ret[-2])
-       

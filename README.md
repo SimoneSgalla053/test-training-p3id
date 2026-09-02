@@ -21,28 +21,20 @@ python setup.py install
 
 ## 1. Dataset preparation
 
-Please download [Toulouse Road Network dataset](https://github.com/davide-belli/toulouse-road-network-dataset) by following the steps under **Usage**. The structure of the dataset should be as follows:
+The default configuration trains on the patched P&ID dataset. Keep each PNG beside its paired GraphML annotation under the following root:
 
 ```
 code_root/
 └── data/
-    toulouse-road-network/
-    └── augment/
-        └── images
-    └── augment.pickle
-    └── test/
-        └── images
-    └── test_images.pickle
-    └── test.pickle
-    └── train/
-        └── images
-    └── train_images.pickle
-    └── train.pickle
-    └── valid/
-        └── images
-    └── valid_images.pickle
-    └── valid.pickle
+    P&ID_imgs/
+    └── PID2Graph/
+        └── Patched/
+            ├── Dataset PID/
+            ├── PID2Graph OPEN100/
+            └── PID2Graph Synthetic/
 ```
+
+Samples are split deterministically by their source drawing directory: 80% training, 10% validation, and 10% test. The loader converts GraphML node bounding boxes to normalized center points and uses GraphML edges as graph targets.
 
 ## 2. Training
 

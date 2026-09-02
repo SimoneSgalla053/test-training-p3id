@@ -2,9 +2,21 @@
 *__pycache__
 .ipynb_checkpoints/
 .vscode
+.venv/
 *runs
 *data
 *resources
 *trained_weights
 *models/ops/*
 *.out
+
+# Local annotations and generated evaluation artifacts
+annotation_review/
+coverage.svg
+gt.svg
+
+# Training and test entry points are not part of the deployment repository
+test.py
+train.py
+trainer.py
+models/ops/test.py
