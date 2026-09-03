@@ -101,10 +101,11 @@ class RelationformerEvaluator(SupervisedEvaluator):
 
         h, out = self.network(images)
 
+        model = self.network.module if isinstance(self.network, torch.nn.DataParallel) else self.network
         pred_nodes, pred_edges = relation_infer(
             h.detach(),
             out,
-            self.network,
+            model,
             self.config.MODEL.DECODER.OBJ_TOKEN,
             self.config.MODEL.DECODER.RLN_TOKEN,
             nms=getattr(self.config.INFERENCE, "NMS", False),
@@ -148,7 +149,7 @@ class RelationformerEvaluator(SupervisedEvaluator):
         }
 
 
-def build_evaluator(val_loader, net, optimizer, scheduler, writer, config, device):
+def build_evaluator(val_loader, net, checkpoint_net, optimizer, scheduler, writer, config, device):
     """[summary]
 
     Args:
@@ -168,7 +169,7 @@ def build_evaluator(val_loader, net, optimizer, scheduler, writer, config, devic
                 "%s_%d" % (config.log.exp_name, config.DATA.SEED),
                 "models",
             ),
-            save_dict={"net": net, "optimizer": optimizer, "scheduler": scheduler},
+            save_dict={"net": checkpoint_net, "optimizer": optimizer, "scheduler": scheduler},
             save_key_metric=True,
             key_metric_n_saved=5,
             save_interval=1,
