@@ -14,9 +14,3 @@
 annotation_review/
 coverage.svg
 gt.svg
-
-# Training and test entry points are not part of the deployment repository
-test.py
-train.py
-trainer.py
-models/ops/test.py
