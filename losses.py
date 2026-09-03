@@ -208,13 +208,16 @@ class SetCriterion(nn.Module):
             relation_feature = []
 
             # loop through each of batch to collect the edge and node
-            for batch_id, (pos_edge, n) in enumerate(zip(new_target_edges, target_nodes)):
+            for batch_id, pos_edge in enumerate(new_target_edges):
 
                 # map the predicted object token by the matcher ordering
                 rearranged_object_token = object_token[batch_id, indices[batch_id][0], :]
 
                 # find the -ve edges for training
-                full_adj = torch.ones((n.shape[0], n.shape[0])) - torch.diag(torch.ones(n.shape[0]))
+                matched_node_count = rearranged_object_token.shape[0]
+                full_adj = torch.ones((matched_node_count, matched_node_count)) - torch.diag(
+                    torch.ones(matched_node_count)
+                )
                 full_adj[pos_edge[:, 0], pos_edge[:, 1]] = 0
                 full_adj[pos_edge[:, 1], pos_edge[:, 0]] = 0
                 neg_edges = torch.nonzero(torch.triu(full_adj))
