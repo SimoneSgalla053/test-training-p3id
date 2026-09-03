@@ -107,6 +107,7 @@ class RelationformerEvaluator(SupervisedEvaluator):
             self.network,
             self.config.MODEL.DECODER.OBJ_TOKEN,
             self.config.MODEL.DECODER.RLN_TOKEN,
+            nms=getattr(self.config.INFERENCE, "NMS", False),
             node_threshold=self.config.INFERENCE.NODE_THRESHOLD,
             edge_threshold=self.config.INFERENCE.EDGE_THRESHOLD,
         )

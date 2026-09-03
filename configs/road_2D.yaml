@@ -78,6 +78,7 @@ TRAIN:
 INFERENCE:
   NODE_THRESHOLD: 0.60 # Keep only confident node predictions
   EDGE_THRESHOLD: 0.75 # Suppress low-confidence edges between predicted nodes
+  NMS: True # Suppress duplicate node predictions before scoring relation pairs
 
 log:
   exp_name: "pid_reduced"
