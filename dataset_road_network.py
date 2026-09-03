@@ -94,8 +94,8 @@ class PatchedPIDDataset(Dataset):
             if not image_path.is_file():
                 continue
 
-            group = graph_path.parent.relative_to(root).as_posix()
-            split_value = int(hashlib.sha1(f"{split_seed}:{group}".encode()).hexdigest(), 16) % 100
+            sample_key = graph_path.relative_to(root).as_posix()
+            split_value = int(hashlib.sha1(f"{split_seed}:{sample_key}".encode()).hexdigest(), 16) % 100
             if split_start <= split_value < split_end:
                 if not is_trainable_pid_graph(graph_path):
                     skipped_graphs += 1
