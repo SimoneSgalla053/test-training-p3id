@@ -41,7 +41,7 @@ class RelationformerTrainer(SupervisedTrainer):
 
         valid_token = torch.argmax(out["pred_logits"], -1)
         # valid_token = torch.sigmoid(nodes_prob[...,3])>0.5
-        print("valid_token number", valid_token.sum(1))
+        # print("valid_token number", valid_token.sum(1))
 
         # pred_nodes, pred_edges = relation_infer(h, out, self.network.relation_embed)
 
@@ -66,7 +66,7 @@ class RelationformerTrainer(SupervisedTrainer):
 
 
 def build_trainer(
-    train_loader, net, checkpoint_net, loss, optimizer, scheduler, writer, evaluator, config, device, fp16=False
+    train_loader, net, loss, optimizer, scheduler, writer, evaluator, config, device, fp16=False
 ):
     """[summary]
 
@@ -100,7 +100,7 @@ def build_trainer(
                 "%s_%d" % (config.log.exp_name, config.DATA.SEED),
                 "models",
             ),
-            save_dict={"net": checkpoint_net, "optimizer": optimizer, "scheduler": scheduler},
+            save_dict={"net": net, "optimizer": optimizer, "scheduler": scheduler},
             save_interval=1,
             n_saved=1,
         ),

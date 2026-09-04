@@ -23,11 +23,6 @@ parser.add_argument(
     default=[0],
     help="list of index where skip conn will be made",
 )
-parser.add_argument(
-    "--data_parallel",
-    action="store_true",
-    help="split each training batch across all CUDA_VISIBLE_DEVICES GPUs",
-)
 
 
 class obj:
@@ -53,7 +48,6 @@ def main(args):
     import logging
     import ignite
     import torch
-    import torch.nn as nn
     from monai.data import DataLoader
     from monai.engines import SupervisedTrainer
     from monai.handlers import MeanDice, StatsHandler
@@ -79,11 +73,6 @@ def main(args):
         print("CUDA is unavailable; training on CPU.")
 
     net = build_model(config).to(device)
-    checkpoint_net = net
-    if args.data_parallel:
-        if device.type != "cuda" or len(args.cuda_visible_device) < 2:
-            raise ValueError("--data_parallel requires at least two CUDA devices")
-        net = nn.DataParallel(net)
 
     matcher = build_matcher(config)
     loss = SetCriterion(config, matcher, net)
@@ -157,13 +146,10 @@ def main(args):
         ),
     )
 
-    evaluator = build_evaluator(
-        val_loader, net, checkpoint_net, optimizer, scheduler, writer, config, device
-    )
+    evaluator = build_evaluator(val_loader, net, optimizer, scheduler, writer, config, device)
     trainer = build_trainer(
         train_loader,
         net,
-        checkpoint_net,
         loss,
         optimizer,
         scheduler,
