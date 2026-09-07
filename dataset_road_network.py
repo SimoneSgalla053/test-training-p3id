@@ -77,7 +77,7 @@ class PatchedPIDDataset(Dataset):
         "test": (90, 100),
     }
 
-    def __init__(self, root_path, split="train", image_size=(512, 512), split_seed=10):
+    def __init__(self, root_path, split="train", image_size=(512, 512), split_seed=10, max_nodes=None):
         if split not in self.SPLIT_RANGES:
             raise ValueError(f"Unsupported P&ID split: {split}")
 
@@ -97,7 +97,7 @@ class PatchedPIDDataset(Dataset):
             sample_key = graph_path.relative_to(root).as_posix()
             split_value = int(hashlib.sha1(f"{split_seed}:{sample_key}".encode()).hexdigest(), 16) % 100
             if split_start <= split_value < split_end:
-                if not is_trainable_pid_graph(graph_path):
+                if not is_trainable_pid_graph(graph_path, max_nodes=max_nodes):
                     skipped_graphs += 1
                     continue
                 self.samples.append(
@@ -127,14 +127,16 @@ class PatchedPIDDataset(Dataset):
 
 
 def load_pid_graph(graph_path, image_path):
-    """Converts GraphML bounding boxes to normalized node centers and edge indices."""
+    """Converts GraphML bounding boxes to normalized node centers and edge indices.
+
+    Nodes that take part in no edge are dropped, since only line connectivity is learned.
+    """
     with Image.open(image_path) as image:
         width, height = image.size
 
     namespace = "{http://graphml.graphdrawing.org/xmlns}"
     graph = ElementTree.parse(graph_path).getroot().find(f"{namespace}graph")
-    node_indices = {}
-    node_centers = []
+    node_centers = {}
     for node in graph.findall(f"{namespace}node"):
         attributes = {data.get("key"): data.text for data in node.findall(f"{namespace}data")}
         xmin = attributes.get("d1", attributes.get("d5"))
@@ -144,25 +146,31 @@ def load_pid_graph(graph_path, image_path):
         if None in (xmin, ymin, xmax, ymax):
             raise ValueError(f"Node {node.get('id')} in {graph_path} has no bounding box")
 
-        node_indices[node.get("id")] = len(node_centers)
-        node_centers.append(
-            ((float(xmin) + float(xmax)) / (2 * width), (float(ymin) + float(ymax)) / (2 * height))
+        node_centers[node.get("id")] = (
+            (float(xmin) + float(xmax)) / (2 * width),
+            (float(ymin) + float(ymax)) / (2 * height),
         )
 
-    edge_indices = []
+    edge_pairs = set()
     for edge in graph.findall(f"{namespace}edge"):
         source, target = edge.get("source"), edge.get("target")
-        if source in node_indices and target in node_indices and source != target:
-            edge_indices.append((node_indices[source], node_indices[target]))
+        if source in node_centers and target in node_centers and source != target:
+            edge_pairs.add((source, target) if source < target else (target, source))
 
-    if not edge_indices:
+    if not edge_pairs:
         raise ValueError(f"Graph {graph_path} has no usable edges")
-    return torch.tensor(node_centers, dtype=torch.float32), torch.tensor(
-        edge_indices, dtype=torch.long
+
+    connected_ids = sorted({node_id for pair in edge_pairs for node_id in pair})
+    node_indices = {node_id: index for index, node_id in enumerate(connected_ids)}
+    nodes = torch.tensor([node_centers[node_id] for node_id in connected_ids], dtype=torch.float32)
+    edges = torch.tensor(
+        sorted((node_indices[source], node_indices[target]) for source, target in edge_pairs),
+        dtype=torch.long,
     )
+    return nodes, edges
 
 
-def is_trainable_pid_graph(graph_path):
+def is_trainable_pid_graph(graph_path, max_nodes=None):
     namespace = "{http://graphml.graphdrawing.org/xmlns}"
     graph = ElementTree.parse(graph_path).getroot().find(f"{namespace}graph")
     node_ids = set()
@@ -177,6 +185,9 @@ def is_trainable_pid_graph(graph_path):
         if None in bounding_box:
             return False
         node_ids.add(node.get("id"))
+
+    if max_nodes is not None and len(node_ids) > max_nodes:
+        return False
 
     return any(
         edge.get("source") in node_ids
@@ -287,6 +298,7 @@ def build_road_network_data(config, mode="split"):
             "root_path": config.DATA.DATA_PATH,
             "image_size": config.DATA.IMG_SIZE,
             "split_seed": config.DATA.SEED,
+            "max_nodes": config.MODEL.DECODER.OBJ_TOKEN,
         }
         if mode == "split":
             return PatchedPIDDataset(split="train", **dataset_kwargs), PatchedPIDDataset(

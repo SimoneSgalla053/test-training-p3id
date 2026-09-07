@@ -40,6 +40,10 @@ class RelationFormer(nn.Module):
         self.with_box_refine = config.MODEL.DECODER.WITH_BOX_REFINE
         self.num_classes = config.MODEL.NUM_CLASSES
 
+        # ImageNet statistics expected by the pretrained ResNet backbone
+        self.register_buffer("pixel_mean", torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1))
+        self.register_buffer("pixel_std", torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1))
+
         self.class_embed = nn.Linear(config.MODEL.DECODER.HIDDEN_DIM, 2)
         self.bbox_embed = MLP(
             config.MODEL.DECODER.HIDDEN_DIM, config.MODEL.DECODER.HIDDEN_DIM, 4, 3
@@ -90,7 +94,10 @@ class RelationFormer(nn.Module):
 
     def forward(self, samples):
         samples = nested_tensor_from_tensor_list(
-            [tensor.expand(3, -1, -1).contiguous() for tensor in samples]
+            [
+                ((tensor.expand(3, -1, -1) - self.pixel_mean) / self.pixel_std).contiguous()
+                for tensor in samples
+            ]
         )
 
         # Deformable Transformer backbone

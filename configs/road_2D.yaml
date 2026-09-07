@@ -1,7 +1,7 @@
 DATA:
   DIM: 2 # data dimension
   BATCH_SIZE: 20
-  DATA_PATH: "./data/P&ID_imgs/PID2Graph/PID2Grpah-reducted" # Reduced patched P&ID dataset root
+  DATA_PATH: "./data/P&ID_imgs/PID2Graph/Patched" # Patched P&ID root only (never the Complete sheets)
   DATASET: "patched-pid-2D"
   IMG_SIZE: [512, 512] # Input image size
   NUM_WORKERS: 4 # Number of data loading threads
@@ -74,11 +74,15 @@ TRAIN:
   W_NODE: 4.0
   W_EDGE: 3.0
   RANDOMIZE_EDGE_DIRECTIONS: True
+  # edge sampling: all GT edges are positives, negatives are sampled per image
+  MAX_POS_EDGES: null # null = keep every ground-truth edge (random subset otherwise)
+  NEG_EDGE_RATIO: 4 # negatives sampled per positive edge
+  MIN_NEG_EDGES: 20 # floor on sampled negatives for graphs with very few edges
 
 INFERENCE:
   NODE_THRESHOLD: 0.60 # Keep only confident node predictions
   EDGE_THRESHOLD: 0.75 # Suppress low-confidence edges between predicted nodes
-  NMS: True # Suppress duplicate node predictions before scoring relation pairs
+  NMS: False # P&ID connectors sit ~10px from symbol centres; NMS would merge them
 
 log:
   exp_name: "pid_reduced"
