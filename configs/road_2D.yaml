@@ -5,7 +5,7 @@ DATA:
   CACHE_DIR: null # preprocessed uint8 images + graphs; null = ~/.cache/relationformer (Kaggle: /kaggle/tmp)
   DATASET: "patched-pid-2D"
   IMG_SIZE: [512, 512] # Input image size
-  NUM_WORKERS: 4 # Number of data loading threads
+  NUM_WORKERS: 2 # per GPU process; data comes from a uint8 memmap so 0-2 is enough (host RAM!)
   SEED: 10 # random seed for reproducibility
 
 MODEL:

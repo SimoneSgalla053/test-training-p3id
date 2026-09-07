@@ -107,18 +107,22 @@ def training(local_rank, args):
 
     train_sampler = DistributedSampler(train_ds, shuffle=True) if world_size > 1 else None
     val_sampler = DistributedSampler(val_ds, shuffle=False) if world_size > 1 else None
+    # workers are forked from a CUDA process (~GBs RSS each): keep them few, the
+    # memmap dataset makes __getitem__ nearly free anyway
+    num_workers = config.DATA.NUM_WORKERS
     loader_kwargs = {
         "batch_size": config.DATA.BATCH_SIZE,
-        "num_workers": config.DATA.NUM_WORKERS,
+        "num_workers": num_workers,
         "collate_fn": image_graph_collate_road_network,
         "pin_memory": device.type == "cuda",
     }
-    if config.DATA.NUM_WORKERS > 0:
-        loader_kwargs["persistent_workers"] = True
-        loader_kwargs["prefetch_factor"] = 4
+    train_kwargs = dict(loader_kwargs)
+    if num_workers > 0:
+        train_kwargs["persistent_workers"] = True
+        train_kwargs["prefetch_factor"] = 2
 
     train_loader = DataLoader(
-        train_ds, shuffle=train_sampler is None, sampler=train_sampler, **loader_kwargs
+        train_ds, shuffle=train_sampler is None, sampler=train_sampler, **train_kwargs
     )
     val_loader = DataLoader(val_ds, shuffle=False, sampler=val_sampler, **loader_kwargs)
 
@@ -157,7 +161,11 @@ def training(local_rank, args):
     )
 
     scheduler = torch.optim.lr_scheduler.StepLR(optimizer, config.TRAIN.LR_DROP)
-    scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
+    scaler = (
+        torch.amp.GradScaler("cuda", enabled=use_amp)
+        if hasattr(torch.amp, "GradScaler")
+        else torch.cuda.amp.GradScaler(enabled=use_amp)
+    )
 
     if args.resume:
         checkpoint = torch.load(args.resume, map_location="cpu")
