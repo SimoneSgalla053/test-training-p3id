@@ -2,7 +2,7 @@ DATA:
   DIM: 2 # data dimension
   BATCH_SIZE: 20 # per GPU
   DATA_PATH: "./data/P&ID_imgs/PID2Graph/Patched" # Patched P&ID root only (never the Complete sheets)
-  CACHE_DIR: /kaggle/tmp # preprocessed uint8 images + graphs; null = ~/.cache/relationformer (Kaggle: /kaggle/tmp)
+  CACHE_DIR: null # preprocessed uint8 images + graphs; null = ~/.cache/relationformer (Kaggle: /kaggle/tmp)
   DATASET: "patched-pid-2D"
   IMG_SIZE: [512, 512] # Input image size
   NUM_WORKERS: 4 # Number of data loading threads
