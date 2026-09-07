@@ -34,11 +34,29 @@ def dict2obj(dict1):
     return json.loads(json.dumps(dict1), object_hook=obj)
 
 
+def load_config(path, verbose):
+    with open(path) as f:
+        config = yaml.load(f, Loader=yaml.FullLoader)
+    if verbose:
+        print("\n*** Config file")
+        print(path)
+        print(config["log"]["message"])
+    return dict2obj(config)
+
+
 def main(args):
     os.environ["CUDA_VISIBLE_DEVICES"] = ",".join(map(str, args.cuda_visible_device))
 
     import torch
     import ignite.distributed as idist
+    from dataset_road_network import build_road_network_data
+
+    config = load_config(args.config, verbose=True)
+
+    # build index + preprocessing cache once here: doing it inside a rank would
+    # leave the other ranks blocked on a collective past the NCCL timeout
+    train_ds, val_ds = build_road_network_data(config, mode="split")
+    del train_ds, val_ds
 
     num_gpus = torch.cuda.device_count() if args.device == "cuda" else 0
     backend = "nccl" if num_gpus > 1 else None
@@ -63,16 +81,7 @@ def training(local_rank, args):
 
     rank = idist.get_rank()
     world_size = idist.get_world_size()
-
-    # Load the config files
-    with open(args.config) as f:
-        if rank == 0:
-            print("\n*** Config file")
-            print(args.config)
-        config = yaml.load(f, Loader=yaml.FullLoader)
-        if rank == 0:
-            print(config["log"]["message"])
-    config = dict2obj(config)
+    config = load_config(args.config, verbose=False)
 
     torch.backends.cudnn.benchmark = True
     torch.backends.cudnn.enabled = True
@@ -93,12 +102,8 @@ def training(local_rank, args):
     matcher = build_matcher(config)
     loss = SetCriterion(config, matcher, net)
 
-    # rank 0 builds the dataset index/preprocessing cache, the others reuse it
-    if rank > 0:
-        idist.barrier()
+    # cache was built in main(); every rank just loads it
     train_ds, val_ds = build_road_network_data(config, mode="split")
-    if rank == 0 and world_size > 1:
-        idist.barrier()
 
     train_sampler = DistributedSampler(train_ds, shuffle=True) if world_size > 1 else None
     val_sampler = DistributedSampler(val_ds, shuffle=False) if world_size > 1 else None
