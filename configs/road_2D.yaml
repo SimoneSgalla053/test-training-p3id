@@ -1,6 +1,6 @@
 DATA:
   DIM: 2 # data dimension
-  BATCH_SIZE: 20 # per GPU
+  BATCH_SIZE: 12 # per GPU; ~0.6 GB/img of activations at 512^2 with AMP -> fits a 15 GB T4
   DATA_PATH: "./data/P&ID_imgs/PID2Graph/Patched" # Patched P&ID root only (never the Complete sheets)
   CACHE_DIR: null # preprocessed uint8 images + graphs; null = ~/.cache/relationformer (Kaggle: /kaggle/tmp)
   DATASET: "patched-pid-2D"
