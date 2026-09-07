@@ -85,35 +85,13 @@ class PatchedPIDDataset(Dataset):
         if not root.is_dir():
             raise FileNotFoundError(f"P&ID dataset directory does not exist: {root}")
 
-        split_start, split_end = self.SPLIT_RANGES[split]
         self.image_size = tuple(image_size)
-        self.samples = []
-        skipped_graphs = 0
-        for graph_path in sorted(root.rglob("*.graphml")):
-            image_path = graph_path.with_suffix(".png")
-            if not image_path.is_file():
-                continue
-
-            sample_key = graph_path.relative_to(root).as_posix()
-            split_value = int(hashlib.sha1(f"{split_seed}:{sample_key}".encode()).hexdigest(), 16) % 100
-            if split_start <= split_value < split_end:
-                if not is_trainable_pid_graph(graph_path, max_nodes=max_nodes):
-                    skipped_graphs += 1
-                    continue
-                self.samples.append(
-                    (
-                        image_path,
-                        graph_path,
-                        graph_path.relative_to(root).with_suffix("").as_posix(),
-                    )
-                )
+        self.samples = index_pid_samples(root, split_seed, max_nodes)[split]
 
         if not self.samples:
             raise RuntimeError(f"No paired P&ID samples found for the {split} split under {root}")
 
-        print(
-            f"Loaded {len(self.samples)} P&ID samples for {split} ({skipped_graphs} unusable graphs skipped)."
-        )
+        print(f"Loaded {len(self.samples)} P&ID samples for {split}.")
 
     def __len__(self):
         return len(self.samples)
@@ -124,6 +102,73 @@ class PatchedPIDDataset(Dataset):
         image = tvf.to_tensor(image)
         nodes, edges = load_pid_graph(graph_path, image_path)
         return image[None], nodes, edges, sample_id
+
+
+def index_pid_samples(root, split_seed, max_nodes, cache_dir=None):
+    """Scans the dataset once and returns {split: [(image, graph, id), ...]}.
+
+    Results are cached on disk keyed by the root path, seed and node limit,
+    so subsequent runs skip the expensive rglob + GraphML parsing.
+    """
+    root = Path(root)
+    cache_dir = Path(cache_dir) if cache_dir else Path.home() / ".cache" / "relationformer"
+    cache_key = hashlib.sha1(f"{root.resolve()}:{split_seed}:{max_nodes}".encode()).hexdigest()[:16]
+    cache_path = cache_dir / f"pid_index_{cache_key}.pickle"
+
+    if cache_path.is_file():
+        with open(cache_path, "rb") as cache_file:
+            cached = pickle.load(cache_file)
+        print(f"Loaded P&ID sample index from {cache_path}")
+        return {
+            split: [(root / img, root / graph, sample_id) for img, graph, sample_id in samples]
+            for split, samples in cached.items()
+        }
+
+    print(f"Indexing P&ID samples under {root} (first run, this can take a few minutes)...")
+    start_time = time.time()
+    graph_paths = sorted(root.rglob("*.graphml"))
+    print(f"Found {len(graph_paths)} GraphML files, filtering...")
+
+    splits = {split: [] for split in PatchedPIDDataset.SPLIT_RANGES}
+    skipped_graphs = 0
+    for index, graph_path in enumerate(graph_paths, 1):
+        image_path = graph_path.with_suffix(".png")
+        if not image_path.is_file():
+            continue
+
+        sample_key = graph_path.relative_to(root).as_posix()
+        split_value = int(hashlib.sha1(f"{split_seed}:{sample_key}".encode()).hexdigest(), 16) % 100
+        for split, (split_start, split_end) in PatchedPIDDataset.SPLIT_RANGES.items():
+            if split_start <= split_value < split_end:
+                if is_trainable_pid_graph(graph_path, max_nodes=max_nodes):
+                    splits[split].append(
+                        (
+                            image_path.relative_to(root).as_posix(),
+                            graph_path.relative_to(root).as_posix(),
+                            graph_path.relative_to(root).with_suffix("").as_posix(),
+                        )
+                    )
+                else:
+                    skipped_graphs += 1
+                break
+
+        if index % 5000 == 0:
+            print(f"  {index}/{len(graph_paths)} graphs processed ({time.time() - start_time:.0f}s)")
+
+    print(
+        f"Indexing done in {time.time() - start_time:.0f}s "
+        f"({skipped_graphs} unusable graphs skipped): "
+        + ", ".join(f"{split}={len(samples)}" for split, samples in splits.items())
+    )
+
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    with open(cache_path, "wb") as cache_file:
+        pickle.dump(splits, cache_file)
+
+    return {
+        split: [(root / img, root / graph, sample_id) for img, graph, sample_id in samples]
+        for split, samples in splits.items()
+    }
 
 
 def load_pid_graph(graph_path, image_path):
