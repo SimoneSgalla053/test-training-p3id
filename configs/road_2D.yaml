@@ -67,6 +67,7 @@ TRAIN:
   SAVE_PATH: "./trained_weights/" # save path for the checkpoint, log and val results
   VAL_INTERVAL: 1 # validation interval
   SAVE_VAL: True # save validation data
+  LOG_INTERVAL: 50 # iterations between progress log lines (also written to runs/<exp>/train.log)
   EARLY_STOPPING_PATIENCE: 10 # stop after N validations without val_smd improvement (null = disabled)
   EARLY_STOPPING_MIN_DELTA: 0.0 # minimum val_smd decrease to count as an improvement
   MAX_HOURS: null # stop cleanly before this wall-clock budget (Kaggle commit limit is 12h -> use ~11)

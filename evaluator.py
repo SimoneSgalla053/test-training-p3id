@@ -98,19 +98,19 @@ class RelationformerEvaluator(SupervisedEvaluator):
 
         self.network.eval()
 
-        with torch.autocast("cuda", dtype=torch.float16, enabled=self.use_amp):
+        with torch.no_grad(), torch.autocast("cuda", dtype=torch.float16, enabled=self.use_amp):
             h, out = self.network(images)
 
-        pred_nodes, pred_edges = relation_infer(
-            h.detach(),
-            out,
-            self.network,
-            self.config.MODEL.DECODER.OBJ_TOKEN,
-            self.config.MODEL.DECODER.RLN_TOKEN,
-            nms=getattr(self.config.INFERENCE, "NMS", False),
-            node_threshold=self.config.INFERENCE.NODE_THRESHOLD,
-            edge_threshold=self.config.INFERENCE.EDGE_THRESHOLD,
-        )
+            pred_nodes, pred_edges = relation_infer(
+                h,
+                out,
+                self.network,
+                self.config.MODEL.DECODER.OBJ_TOKEN,
+                self.config.MODEL.DECODER.RLN_TOKEN,
+                nms=getattr(self.config.INFERENCE, "NMS", False),
+                node_threshold=self.config.INFERENCE.NODE_THRESHOLD,
+                edge_threshold=self.config.INFERENCE.EDGE_THRESHOLD,
+            )
 
         if (
             self.config.TRAIN.SAVE_VAL

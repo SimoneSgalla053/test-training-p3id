@@ -44,8 +44,30 @@ def load_config(path, verbose):
     return dict2obj(config)
 
 
+def setup_logging(config, rank):
+    import logging
+
+    # stdout is a pipe under `!python` / commit mode: without this, output only shows up in blocks
+    sys.stdout.reconfigure(line_buffering=True)
+    handlers = [logging.StreamHandler(sys.stdout)]
+    if rank == 0:
+        log_dir = os.path.join(
+            config.TRAIN.SAVE_PATH, "runs", "%s_%d" % (config.log.exp_name, config.DATA.SEED)
+        )
+        os.makedirs(log_dir, exist_ok=True)
+        handlers.append(logging.FileHandler(os.path.join(log_dir, "train.log")))
+    logging.basicConfig(
+        level=logging.INFO if rank == 0 else logging.WARNING,
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+        datefmt="%H:%M:%S",
+        handlers=handlers,
+        force=True,
+    )
+
+
 def main(args):
     os.environ["CUDA_VISIBLE_DEVICES"] = ",".join(map(str, args.cuda_visible_device))
+    sys.stdout.reconfigure(line_buffering=True)
 
     import torch
     import ignite.distributed as idist
@@ -65,7 +87,6 @@ def main(args):
 
 
 def training(local_rank, args):
-    import logging
     import itertools
     import torch
     import ignite.distributed as idist
@@ -82,6 +103,7 @@ def training(local_rank, args):
     rank = idist.get_rank()
     world_size = idist.get_world_size()
     config = load_config(args.config, verbose=False)
+    setup_logging(config, rank)
 
     torch.backends.cudnn.benchmark = True
     torch.backends.cudnn.enabled = True
@@ -205,7 +227,6 @@ def training(local_rank, args):
         trainer.state.epoch = last_epoch
         trainer.state.iteration = trainer.state.epoch_length * last_epoch
 
-    logging.basicConfig(stream=sys.stdout, level=logging.INFO if rank == 0 else logging.WARNING)
     trainer.run()
 
 

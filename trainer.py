@@ -1,11 +1,11 @@
 import os
 import time
+import logging
 from monai.engines import SupervisedTrainer
 from monai.inferers import SimpleInferer
 from monai.handlers import (
     LrScheduleHandler,
     ValidationHandler,
-    StatsHandler,
     TensorBoardStatsHandler,
     CheckpointSaver,
 )
@@ -26,6 +26,46 @@ def average_gradients(model):
         handle.wait()
     for grad in grads:
         grad.div_(world_size)
+
+
+logger = logging.getLogger("relationformer.train")
+
+
+def attach_progress_logging(trainer, scheduler, log_interval):
+    """Compact progress lines every `log_interval` iterations plus an epoch summary."""
+
+    @trainer.on(Events.EPOCH_STARTED)
+    def _reset(engine):
+        engine.state.log_t0 = time.time()
+        engine.state.log_sum = {}
+        engine.state.log_n = 0
+
+    @trainer.on(Events.ITERATION_COMPLETED)
+    def _accumulate(engine):
+        for key, value in engine.state.output["loss"].items():
+            engine.state.log_sum[key] = engine.state.log_sum.get(key, 0.0) + float(value)
+        engine.state.log_n += 1
+
+    @trainer.on(Events.ITERATION_COMPLETED(every=log_interval))
+    def _log_iteration(engine):
+        epoch_length = engine.state.epoch_length
+        it = (engine.state.iteration - 1) % epoch_length + 1
+        rate = it / max(time.time() - engine.state.log_t0, 1e-6)
+        losses = " ".join(f"{k}={float(v):.4f}" for k, v in engine.state.output["loss"].items())
+        logger.info(
+            f"epoch {engine.state.epoch}/{engine.state.max_epochs} "
+            f"iter {it}/{epoch_length} {losses} lr={scheduler.get_last_lr()[0]:.2e} "
+            f"{rate:.2f} it/s eta {(epoch_length - it) / rate / 60:.0f} min"
+        )
+
+    @trainer.on(Events.EPOCH_COMPLETED)
+    def _log_epoch(engine):
+        n = max(engine.state.log_n, 1)
+        means = " ".join(f"{k}={v / n:.4f}" for k, v in engine.state.log_sum.items())
+        logger.info(
+            f"epoch {engine.state.epoch}/{engine.state.max_epochs} done in "
+            f"{(time.time() - engine.state.log_t0) / 60:.1f} min: mean {means}"
+        )
 
 
 # define customized trainer
@@ -97,7 +137,6 @@ def build_trainer(
             "total_loss": "total",
         }
         train_handlers += [
-            StatsHandler(tag_name="train_loss", output_transform=lambda x: x["loss"]["total"]),
             CheckpointSaver(
                 save_dir=os.path.join(
                     config.TRAIN.SAVE_PATH,
@@ -136,6 +175,9 @@ def build_trainer(
         scaler=scaler,
         clip_max_norm=float(getattr(config.TRAIN, "CLIP_MAX_NORM", 0.1)),
     )
+
+    if rank == 0:
+        attach_progress_logging(trainer, scheduler, int(getattr(config.TRAIN, "LOG_INTERVAL", 50)))
 
     max_hours = getattr(config.TRAIN, "MAX_HOURS", None)
     if max_hours:
