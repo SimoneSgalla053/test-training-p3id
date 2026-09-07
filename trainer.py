@@ -16,6 +16,8 @@ from monai.transforms import (
 )
 import torch
 from torch.nn.utils import clip_grad_norm
+from ignite.engine import Events
+from ignite.handlers import EarlyStopping
 from inference import relation_infer
 import gc
 
@@ -166,5 +168,16 @@ def build_trainer(
         train_handlers=train_handlers,
         # amp=fp16,
     )
+
+    patience = getattr(config.TRAIN, "EARLY_STOPPING_PATIENCE", None)
+    if patience:
+        early_stopping = EarlyStopping(
+            patience=patience,
+            # val_smd is lower-is-better; EarlyStopping expects higher-is-better
+            score_function=lambda engine: -engine.state.metrics["val_smd"],
+            trainer=trainer,
+            min_delta=float(getattr(config.TRAIN, "EARLY_STOPPING_MIN_DELTA", 0.0)),
+        )
+        evaluator.add_event_handler(Events.COMPLETED, early_stopping)
 
     return trainer

@@ -65,6 +65,8 @@ TRAIN:
   SAVE_PATH: "./trained_weights/" # save path for the checkpoint, log and val results
   VAL_INTERVAL: 1 # validation interval
   SAVE_VAL: True # save validation data
+  EARLY_STOPPING_PATIENCE: 10 # stop after N validations without val_smd improvement (null = disabled)
+  EARLY_STOPPING_MIN_DELTA: 0.0 # minimum val_smd decrease to count as an improvement
 
   # loss weight
   LOSSES: ["boxes", "class", "cards", "nodes", "edges"]
