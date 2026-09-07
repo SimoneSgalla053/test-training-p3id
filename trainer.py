@@ -31,7 +31,8 @@ def average_gradients(model):
 class RelationformerTrainer(SupervisedTrainer):
     def __init__(self, *args, scaler, clip_max_norm, **kwargs):
         super().__init__(*args, **kwargs)
-        self.scaler = scaler
+        # not `self.scaler`: MONAI's Trainer.run() resets that attribute to None
+        self.grad_scaler = scaler
         self.clip_max_norm = clip_max_norm
 
     def _iteration(self, engine, batchdata):
@@ -48,16 +49,16 @@ class RelationformerTrainer(SupervisedTrainer):
         self.network.train()
         self.optimizer.zero_grad(set_to_none=True)
 
-        with torch.autocast("cuda", dtype=torch.float16, enabled=self.scaler.is_enabled()):
+        with torch.autocast("cuda", dtype=torch.float16, enabled=self.grad_scaler.is_enabled()):
             h, out = self.network(images)
             losses = self.loss_function(h, out, target)
 
-        self.scaler.scale(losses["total"]).backward()
+        self.grad_scaler.scale(losses["total"]).backward()
         average_gradients(self.network)
-        self.scaler.unscale_(self.optimizer)
+        self.grad_scaler.unscale_(self.optimizer)
         torch.nn.utils.clip_grad_norm_(self.network.parameters(), self.clip_max_norm)
-        self.scaler.step(self.optimizer)
-        self.scaler.update()
+        self.grad_scaler.step(self.optimizer)
+        self.grad_scaler.update()
 
         return {"images": images, "points": nodes, "edges": edges, "loss": losses}
 
