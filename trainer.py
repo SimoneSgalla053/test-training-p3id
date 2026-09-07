@@ -1,4 +1,5 @@
 import os
+import time
 from monai.engines import SupervisedTrainer
 from monai.inferers import SimpleInferer
 from monai.handlers import (
@@ -135,6 +136,34 @@ def build_trainer(
         scaler=scaler,
         clip_max_norm=float(getattr(config.TRAIN, "CLIP_MAX_NORM", 0.1)),
     )
+
+    max_hours = getattr(config.TRAIN, "MAX_HOURS", None)
+    if max_hours:
+        budget = float(max_hours) * 3600
+
+        @trainer.on(Events.STARTED)
+        def _start_clock(engine):
+            engine.state.wall_start = time.time()
+
+        @trainer.on(Events.EPOCH_STARTED)
+        def _epoch_clock(engine):
+            engine.state.epoch_start = time.time()
+
+        # registered after ValidationHandler, so the epoch time includes validation
+        @trainer.on(Events.EPOCH_COMPLETED)
+        def _stop_on_budget(engine):
+            now = time.time()
+            elapsed, epoch_time = now - engine.state.wall_start, now - engine.state.epoch_start
+            stop = torch.tensor([elapsed + epoch_time > budget], device=device)
+            # ranks must agree, otherwise the survivor hangs in the next all_reduce
+            stop = bool(idist.all_reduce(stop.int(), "MAX").item()) if idist.get_world_size() > 1 else bool(stop)
+            if stop:
+                if rank == 0:
+                    print(
+                        f"Stopping after epoch {engine.state.epoch}: {elapsed / 3600:.2f}h elapsed, "
+                        f"next epoch (~{epoch_time / 60:.0f} min) would exceed MAX_HOURS={max_hours}"
+                    )
+                engine.terminate()
 
     patience = getattr(config.TRAIN, "EARLY_STOPPING_PATIENCE", None)
     if patience:
