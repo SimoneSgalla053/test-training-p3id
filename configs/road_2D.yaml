@@ -1,7 +1,8 @@
 DATA:
   DIM: 2 # data dimension
-  BATCH_SIZE: 20
+  BATCH_SIZE: 20 # per GPU
   DATA_PATH: "./data/P&ID_imgs/PID2Graph/Patched" # Patched P&ID root only (never the Complete sheets)
+  CACHE_DIR: null # preprocessed uint8 images + graphs; null = ~/.cache/relationformer (Kaggle: /kaggle/tmp)
   DATASET: "patched-pid-2D"
   IMG_SIZE: [512, 512] # Input image size
   NUM_WORKERS: 4 # Number of data loading threads
@@ -55,12 +56,13 @@ MODEL:
     C_NODE: 5
 
 TRAIN:
-  EPOCHS: 80
+  EPOCHS: 30
   LR: 1e-4
   LR_BACKBONE: 3e-5
   WEIGHT_DECAY: 1e-4
-  LR_DROP: 40
-  CLIP_MAX_NORM: 0.1 # hardcoded
+  LR_DROP: 20
+  CLIP_MAX_NORM: 0.1
+  AMP: True # fp16 autocast + GradScaler (T4 tensor cores)
 
   SAVE_PATH: "./trained_weights/" # save path for the checkpoint, log and val results
   VAL_INTERVAL: 1 # validation interval

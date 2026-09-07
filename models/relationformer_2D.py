@@ -134,11 +134,12 @@ class RelationFormer(nn.Module):
 
         object_token = hs[..., : self.obj_token, :]
 
-        class_prob = self.class_embed(object_token)
-        coord_loc = self.bbox_embed(object_token).sigmoid()
+        # fp32 outputs so matcher/GIoU/relation loss are unaffected by autocast
+        class_prob = self.class_embed(object_token).float()
+        coord_loc = self.bbox_embed(object_token).float().sigmoid()
 
         out = {"pred_logits": class_prob, "pred_nodes": coord_loc}
-        return hs, out
+        return hs.float(), out
 
 
 class MLP(nn.Module):

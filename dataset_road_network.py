@@ -4,13 +4,16 @@ import torch
 from torch.utils.data import Dataset
 import torchvision.transforms.functional as tvf
 from PIL import Image
+import numpy as np
 
+import os
 import time
 import pickle
 import random
 import yaml
 import json
 import hashlib
+from multiprocessing import Pool
 from pathlib import Path
 from xml.etree import ElementTree
 
@@ -77,7 +80,15 @@ class PatchedPIDDataset(Dataset):
         "test": (90, 100),
     }
 
-    def __init__(self, root_path, split="train", image_size=(512, 512), split_seed=10, max_nodes=None):
+    def __init__(
+        self,
+        root_path,
+        split="train",
+        image_size=(512, 512),
+        split_seed=10,
+        max_nodes=None,
+        cache_dir=None,
+    ):
         if split not in self.SPLIT_RANGES:
             raise ValueError(f"Unsupported P&ID split: {split}")
 
@@ -85,23 +96,104 @@ class PatchedPIDDataset(Dataset):
         if not root.is_dir():
             raise FileNotFoundError(f"P&ID dataset directory does not exist: {root}")
 
+        cache_dir = resolve_cache_dir(cache_dir)
         self.image_size = tuple(image_size)
-        self.samples = index_pid_samples(root, split_seed, max_nodes)[split]
+        samples = index_pid_samples(root, split_seed, max_nodes, cache_dir)[split]
 
-        if not self.samples:
+        if not samples:
             raise RuntimeError(f"No paired P&ID samples found for the {split} split under {root}")
 
-        print(f"Loaded {len(self.samples)} P&ID samples for {split}.")
+        self.ids = [sample_id for _, _, sample_id in samples]
+        cache_key = hashlib.sha1(
+            f"{root.resolve()}:{split_seed}:{max_nodes}:{split}:{self.image_size}".encode()
+        ).hexdigest()[:16]
+        self.images, self.graphs = preprocess_pid_samples(
+            samples, self.image_size, cache_dir / f"pid_{cache_key}_{split}"
+        )
+
+        print(f"Loaded {len(self.ids)} P&ID samples for {split}.")
 
     def __len__(self):
-        return len(self.samples)
+        return len(self.ids)
 
     def __getitem__(self, idx):
-        image_path, graph_path, sample_id = self.samples[idx]
-        image = Image.open(image_path).convert("L").resize(self.image_size, Image.BILINEAR)
-        image = tvf.to_tensor(image)
-        nodes, edges = load_pid_graph(graph_path, image_path)
-        return image[None], nodes, edges, sample_id
+        image = torch.from_numpy(np.array(self.images[idx])).float().div_(255)
+        nodes, edges = self.graphs[idx]
+        return image[None, None], nodes, edges, self.ids[idx]
+
+
+def resolve_cache_dir(cache_dir=None):
+    return Path(cache_dir) if cache_dir else Path.home() / ".cache" / "relationformer"
+
+
+_WORKER_IMAGES = None
+_WORKER_IMAGE_SIZE = None
+
+
+def _init_pid_worker(images_path, image_size):
+    global _WORKER_IMAGES, _WORKER_IMAGE_SIZE
+    _WORKER_IMAGES = np.load(images_path, mmap_mode="r+")
+    _WORKER_IMAGE_SIZE = image_size
+
+
+def _preprocess_pid_sample(job):
+    index, image_path, graph_path = job
+    with Image.open(image_path) as image:
+        width, height = image.size
+        resized = image.convert("L").resize(_WORKER_IMAGE_SIZE, Image.BILINEAR)
+        _WORKER_IMAGES[index] = np.asarray(resized, dtype=np.uint8)
+    nodes, edges = load_pid_graph(graph_path, width, height)
+    return index, nodes, edges
+
+
+def preprocess_pid_samples(samples, image_size, cache_prefix, num_workers=None):
+    """Decodes/resizes every image into a uint8 memmap and parses graphs to tensors, once.
+
+    Returns (images memmap [N, H, W], list of (nodes, edges)). The graphs pickle is written
+    last and doubles as the completion marker for the image memmap.
+    """
+    images_path = Path(f"{cache_prefix}_images.npy")
+    graphs_path = Path(f"{cache_prefix}_graphs.pickle")
+
+    if images_path.is_file() and graphs_path.is_file():
+        with open(graphs_path, "rb") as graphs_file:
+            graphs = pickle.load(graphs_file)
+        images = np.load(images_path, mmap_mode="r")
+        if images.shape[0] == len(graphs) == len(samples):
+            print(f"Loaded preprocessed P&ID samples from {cache_prefix}_*")
+            return images, graphs
+
+    print(f"Preprocessing {len(samples)} P&ID samples into {cache_prefix}_* (first run)...")
+    start_time = time.time()
+    images_path.parent.mkdir(parents=True, exist_ok=True)
+    width, height = image_size
+    images = np.lib.format.open_memmap(
+        images_path, mode="w+", dtype=np.uint8, shape=(len(samples), height, width)
+    )
+    images.flush()
+    del images
+
+    jobs = [
+        (index, str(image_path), str(graph_path))
+        for index, (image_path, graph_path, _) in enumerate(samples)
+    ]
+    graphs = [None] * len(samples)
+    num_workers = num_workers or os.cpu_count() or 1
+    with Pool(
+        num_workers, initializer=_init_pid_worker, initargs=(str(images_path), tuple(image_size))
+    ) as pool:
+        for done, (index, nodes, edges) in enumerate(
+            pool.imap_unordered(_preprocess_pid_sample, jobs, chunksize=64), 1
+        ):
+            graphs[index] = (nodes, edges)
+            if done % 5000 == 0:
+                print(f"  {done}/{len(samples)} samples preprocessed ({time.time() - start_time:.0f}s)")
+
+    with open(graphs_path, "wb") as graphs_file:
+        pickle.dump(graphs, graphs_file)
+    print(f"Preprocessing done in {time.time() - start_time:.0f}s")
+
+    return np.load(images_path, mmap_mode="r"), graphs
 
 
 def index_pid_samples(root, split_seed, max_nodes, cache_dir=None):
@@ -111,7 +203,7 @@ def index_pid_samples(root, split_seed, max_nodes, cache_dir=None):
     so subsequent runs skip the expensive rglob + GraphML parsing.
     """
     root = Path(root)
-    cache_dir = Path(cache_dir) if cache_dir else Path.home() / ".cache" / "relationformer"
+    cache_dir = resolve_cache_dir(cache_dir)
     cache_key = hashlib.sha1(f"{root.resolve()}:{split_seed}:{max_nodes}".encode()).hexdigest()[:16]
     cache_path = cache_dir / f"pid_index_{cache_key}.pickle"
 
@@ -171,14 +263,11 @@ def index_pid_samples(root, split_seed, max_nodes, cache_dir=None):
     }
 
 
-def load_pid_graph(graph_path, image_path):
+def load_pid_graph(graph_path, width, height):
     """Converts GraphML bounding boxes to normalized node centers and edge indices.
 
     Nodes that take part in no edge are dropped, since only line connectivity is learned.
     """
-    with Image.open(image_path) as image:
-        width, height = image.size
-
     namespace = "{http://graphml.graphdrawing.org/xmlns}"
     graph = ElementTree.parse(graph_path).getroot().find(f"{namespace}graph")
     node_centers = {}
@@ -344,6 +433,7 @@ def build_road_network_data(config, mode="split"):
             "image_size": config.DATA.IMG_SIZE,
             "split_seed": config.DATA.SEED,
             "max_nodes": config.MODEL.DECODER.OBJ_TOKEN,
+            "cache_dir": getattr(config.DATA, "CACHE_DIR", None),
         }
         if mode == "split":
             return PatchedPIDDataset(split="train", **dataset_kwargs), PatchedPIDDataset(

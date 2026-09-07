@@ -35,67 +35,87 @@ def dict2obj(dict1):
 
 
 def main(args):
-
-    # Load the config files
-    with open(args.config) as f:
-        print("\n*** Config file")
-        print(args.config)
-        config = yaml.load(f, Loader=yaml.FullLoader)
-        print(config["log"]["message"])
-    config = dict2obj(config)
     os.environ["CUDA_VISIBLE_DEVICES"] = ",".join(map(str, args.cuda_visible_device))
 
-    import logging
-    import ignite
     import torch
-    from monai.data import DataLoader
-    from monai.engines import SupervisedTrainer
-    from monai.handlers import MeanDice, StatsHandler
-    from monai.inferers import SimpleInferer
+    import ignite.distributed as idist
+
+    num_gpus = torch.cuda.device_count() if args.device == "cuda" else 0
+    backend = "nccl" if num_gpus > 1 else None
+    with idist.Parallel(backend=backend, nproc_per_node=num_gpus if backend else None) as parallel:
+        parallel.run(training, args)
+
+
+def training(local_rank, args):
+    import logging
+    import itertools
+    import torch
+    import ignite.distributed as idist
+    from torch.utils.data import DataLoader
+    from torch.utils.data.distributed import DistributedSampler
     from dataset_road_network import build_road_network_data, image_graph_collate_road_network
     from evaluator import build_evaluator
     from trainer import build_trainer
     from models import build_model
-    from monai.losses import DiceCELoss
     from tensorboardX import SummaryWriter
     from models.matcher import build_matcher
     from losses import SetCriterion
 
+    rank = idist.get_rank()
+    world_size = idist.get_world_size()
+
+    # Load the config files
+    with open(args.config) as f:
+        if rank == 0:
+            print("\n*** Config file")
+            print(args.config)
+        config = yaml.load(f, Loader=yaml.FullLoader)
+        if rank == 0:
+            print(config["log"]["message"])
+    config = dict2obj(config)
+
     torch.backends.cudnn.benchmark = True
     torch.backends.cudnn.enabled = True
     torch.multiprocessing.set_sharing_strategy("file_system")
-    device = (
-        torch.device("cuda")
-        if args.device == "cuda" and torch.cuda.is_available()
-        else torch.device("cpu")
-    )
-    if args.device == "cuda" and device.type != "cuda":
+    device = idist.device() if args.device == "cuda" and torch.cuda.is_available() else torch.device("cpu")
+    if args.device == "cuda" and device.type != "cuda" and rank == 0:
         print("CUDA is unavailable; training on CPU.")
+    use_amp = bool(getattr(config.TRAIN, "AMP", True)) and device.type == "cuda"
+    if rank == 0:
+        print(f"world_size={world_size} amp={use_amp} device={device}")
 
     net = build_model(config).to(device)
+    if world_size > 1:
+        # only rank 0 downloads pretrained weights; sync every rank to its init
+        for tensor in itertools.chain(net.parameters(), net.buffers()):
+            torch.distributed.broadcast(tensor.data, src=0)
 
     matcher = build_matcher(config)
     loss = SetCriterion(config, matcher, net)
 
+    # rank 0 builds the dataset index/preprocessing cache, the others reuse it
+    if rank > 0:
+        idist.barrier()
     train_ds, val_ds = build_road_network_data(config, mode="split")
+    if rank == 0 and world_size > 1:
+        idist.barrier()
+
+    train_sampler = DistributedSampler(train_ds, shuffle=True) if world_size > 1 else None
+    val_sampler = DistributedSampler(val_ds, shuffle=False) if world_size > 1 else None
+    loader_kwargs = {
+        "batch_size": config.DATA.BATCH_SIZE,
+        "num_workers": config.DATA.NUM_WORKERS,
+        "collate_fn": image_graph_collate_road_network,
+        "pin_memory": device.type == "cuda",
+    }
+    if config.DATA.NUM_WORKERS > 0:
+        loader_kwargs["persistent_workers"] = True
+        loader_kwargs["prefetch_factor"] = 4
 
     train_loader = DataLoader(
-        train_ds,
-        batch_size=config.DATA.BATCH_SIZE,
-        shuffle=True,
-        num_workers=config.DATA.NUM_WORKERS,
-        collate_fn=image_graph_collate_road_network,
-        pin_memory=True,
+        train_ds, shuffle=train_sampler is None, sampler=train_sampler, **loader_kwargs
     )
-
-    val_loader = DataLoader(
-        val_ds,
-        batch_size=config.DATA.BATCH_SIZE,
-        shuffle=False,
-        num_workers=config.DATA.NUM_WORKERS,
-        collate_fn=image_graph_collate_road_network,
-        pin_memory=True,
-    )
+    val_loader = DataLoader(val_ds, shuffle=False, sampler=val_sampler, **loader_kwargs)
 
     param_dicts = [
         {
@@ -132,32 +152,39 @@ def main(args):
     )
 
     scheduler = torch.optim.lr_scheduler.StepLR(optimizer, config.TRAIN.LR_DROP)
+    scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
 
     if args.resume:
         checkpoint = torch.load(args.resume, map_location="cpu")
         net.load_state_dict(checkpoint["net"])
         optimizer.load_state_dict(checkpoint["optimizer"])
         scheduler.load_state_dict(checkpoint["scheduler"])
+        if "scaler" in checkpoint:
+            scaler.load_state_dict(checkpoint["scaler"])
         last_epoch = scheduler.last_epoch
 
-    writer = SummaryWriter(
-        log_dir=os.path.join(
-            config.TRAIN.SAVE_PATH, "runs", "%s_%d" % (config.log.exp_name, config.DATA.SEED)
-        ),
-    )
+    writer = None
+    if rank == 0:
+        writer = SummaryWriter(
+            log_dir=os.path.join(
+                config.TRAIN.SAVE_PATH, "runs", "%s_%d" % (config.log.exp_name, config.DATA.SEED)
+            ),
+        )
 
-    evaluator = build_evaluator(val_loader, net, optimizer, scheduler, writer, config, device)
+    evaluator = build_evaluator(
+        val_loader, net, optimizer, scheduler, scaler, writer, config, device, use_amp=use_amp
+    )
     trainer = build_trainer(
         train_loader,
         net,
         loss,
         optimizer,
         scheduler,
+        scaler,
         writer,
         evaluator,
         config,
         device,
-        # fp16=args.fp16,
     )
 
     if args.resume:
@@ -165,7 +192,7 @@ def main(args):
         trainer.state.epoch = last_epoch
         trainer.state.iteration = trainer.state.epoch_length * last_epoch
 
-    logging.basicConfig(stream=sys.stdout, level=logging.INFO)
+    logging.basicConfig(stream=sys.stdout, level=logging.INFO if rank == 0 else logging.WARNING)
     trainer.run()
 
 

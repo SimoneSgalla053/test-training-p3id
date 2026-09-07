@@ -1,5 +1,4 @@
 import os
-from torch.nn.functional import interpolate
 from monai.engines import SupervisedTrainer
 from monai.inferers import SimpleInferer
 from monai.handlers import (
@@ -8,22 +7,32 @@ from monai.handlers import (
     StatsHandler,
     TensorBoardStatsHandler,
     CheckpointSaver,
-    MeanDice,
-)
-from monai.transforms import (
-    Compose,
-    AsDiscreted,
 )
 import torch
-from torch.nn.utils import clip_grad_norm
+import ignite.distributed as idist
 from ignite.engine import Events
 from ignite.handlers import EarlyStopping
-from inference import relation_infer
-import gc
+
+
+def average_gradients(model):
+    """Manual all-reduce instead of DDP: relation_embed is called from the loss, outside forward."""
+    world_size = idist.get_world_size()
+    if world_size <= 1:
+        return
+    grads = [p.grad for p in model.parameters() if p.grad is not None]
+    handles = [torch.distributed.all_reduce(g, async_op=True) for g in grads]
+    for handle in handles:
+        handle.wait()
+    for grad in grads:
+        grad.div_(world_size)
 
 
 # define customized trainer
 class RelationformerTrainer(SupervisedTrainer):
+    def __init__(self, *args, scaler, clip_max_norm, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.scaler = scaler
+        self.clip_max_norm = clip_max_norm
 
     def _iteration(self, engine, batchdata):
         images, nodes, edges = batchdata[0], batchdata[1], batchdata[2]
@@ -31,124 +40,87 @@ class RelationformerTrainer(SupervisedTrainer):
 
         # inputs, targets = self.get_batch(batchdata, image_keys=IMAGE_KEYS, label_keys="label")
         # inputs = torch.cat(inputs, 1)
-        images = images.to(engine.state.device, non_blocking=False)
-        nodes = [node.to(engine.state.device, non_blocking=False) for node in nodes]
-        edges = [edge.to(engine.state.device, non_blocking=False) for edge in edges]
+        images = images.to(engine.state.device, non_blocking=True)
+        nodes = [node.to(engine.state.device, non_blocking=True) for node in nodes]
+        edges = [edge.to(engine.state.device, non_blocking=True) for edge in edges]
         target = {"nodes": nodes, "edges": edges}
 
         self.network.train()
-        self.optimizer.zero_grad()
+        self.optimizer.zero_grad(set_to_none=True)
 
-        h, out = self.network(images)
+        with torch.autocast("cuda", dtype=torch.float16, enabled=self.scaler.is_enabled()):
+            h, out = self.network(images)
+            losses = self.loss_function(h, out, target)
 
-        valid_token = torch.argmax(out["pred_logits"], -1)
-        # valid_token = torch.sigmoid(nodes_prob[...,3])>0.5
-        # print("valid_token number", valid_token.sum(1))
-
-        # pred_nodes, pred_edges = relation_infer(h, out, self.network.relation_embed)
-
-        losses = self.loss_function(h, out, target)
-
-        # Clip the gradient
-        # clip_grad_norm_(
-        #     self.network.parameters(),
-        #     max_norm=GRADIENT_CLIP_L2_NORM,
-        #     norm_type=2,
-        # )
-        losses["total"].backward()
-
-        _ = torch.nn.utils.clip_grad_norm_(self.network.parameters(), 0.1)
-
-        self.optimizer.step()
-
-        gc.collect()
-        torch.cuda.empty_cache()
+        self.scaler.scale(losses["total"]).backward()
+        average_gradients(self.network)
+        self.scaler.unscale_(self.optimizer)
+        torch.nn.utils.clip_grad_norm_(self.network.parameters(), self.clip_max_norm)
+        self.scaler.step(self.optimizer)
+        self.scaler.update()
 
         return {"images": images, "points": nodes, "edges": edges, "loss": losses}
 
 
 def build_trainer(
-    train_loader, net, loss, optimizer, scheduler, writer, evaluator, config, device, fp16=False
+    train_loader,
+    net,
+    loss,
+    optimizer,
+    scheduler,
+    scaler,
+    writer,
+    evaluator,
+    config,
+    device,
 ):
-    """[summary]
-
-    Args:
-        train_loader ([type]): [description]
-        net ([type]): [description]
-        loss ([type]): [description]
-        optimizer ([type]): [description]
-        evaluator ([type]): [description]
-        scheduler ([type]): [description]
-        max_epochs ([type]): [description]
-        device ([type]): [description]
-
-    Returns:
-        [type]: [description]
-    """
+    rank = idist.get_rank()
     train_handlers = [
         LrScheduleHandler(
             lr_scheduler=scheduler,
-            print_lr=True,
+            print_lr=rank == 0,
             epoch_level=True,
         ),
         ValidationHandler(
             validator=evaluator, interval=config.TRAIN.VAL_INTERVAL, epoch_level=True
         ),
-        StatsHandler(tag_name="train_loss", output_transform=lambda x: x["loss"]["total"]),
-        CheckpointSaver(
-            save_dir=os.path.join(
-                config.TRAIN.SAVE_PATH,
-                "runs",
-                "%s_%d" % (config.log.exp_name, config.DATA.SEED),
-                "models",
-            ),
-            save_dict={"net": net, "optimizer": optimizer, "scheduler": scheduler},
-            save_interval=1,
-            n_saved=1,
-        ),
-        TensorBoardStatsHandler(
-            writer,
-            tag_name="classification_loss",
-            output_transform=lambda x: x["loss"]["class"],
-            global_epoch_transform=lambda x: scheduler.last_epoch,
-        ),
-        TensorBoardStatsHandler(
-            writer,
-            tag_name="node_loss",
-            output_transform=lambda x: x["loss"]["nodes"],
-            global_epoch_transform=lambda x: scheduler.last_epoch,
-        ),
-        TensorBoardStatsHandler(
-            writer,
-            tag_name="edge_loss",
-            output_transform=lambda x: x["loss"]["edges"],
-            global_epoch_transform=lambda x: scheduler.last_epoch,
-        ),
-        TensorBoardStatsHandler(
-            writer,
-            tag_name="box_loss",
-            output_transform=lambda x: x["loss"]["boxes"],
-            global_epoch_transform=lambda x: scheduler.last_epoch,
-        ),
-        TensorBoardStatsHandler(
-            writer,
-            tag_name="card_loss",
-            output_transform=lambda x: x["loss"]["cards"],
-            global_epoch_transform=lambda x: scheduler.last_epoch,
-        ),
-        TensorBoardStatsHandler(
-            writer,
-            tag_name="total_loss",
-            output_transform=lambda x: x["loss"]["total"],
-            global_epoch_transform=lambda x: scheduler.last_epoch,
-        ),
     ]
-    # train_post_transform = Compose(
-    #     [AsDiscreted(keys=("pred", "label"),
-    #     argmax=(True, False),
-    #     to_onehot=True,
-    #     n_classes=N_CLASS)]
-    # )
+    if rank == 0:
+        loss_tags = {
+            "classification_loss": "class",
+            "node_loss": "nodes",
+            "edge_loss": "edges",
+            "box_loss": "boxes",
+            "card_loss": "cards",
+            "total_loss": "total",
+        }
+        train_handlers += [
+            StatsHandler(tag_name="train_loss", output_transform=lambda x: x["loss"]["total"]),
+            CheckpointSaver(
+                save_dir=os.path.join(
+                    config.TRAIN.SAVE_PATH,
+                    "runs",
+                    "%s_%d" % (config.log.exp_name, config.DATA.SEED),
+                    "models",
+                ),
+                save_dict={
+                    "net": net,
+                    "optimizer": optimizer,
+                    "scheduler": scheduler,
+                    "scaler": scaler,
+                },
+                save_interval=1,
+                n_saved=1,
+            ),
+        ] + [
+            TensorBoardStatsHandler(
+                writer,
+                tag_name=tag,
+                output_transform=lambda x, key=key: x["loss"][key],
+                global_epoch_transform=lambda x: scheduler.last_epoch,
+            )
+            for tag, key in loss_tags.items()
+        ]
 
     trainer = RelationformerTrainer(
         device=device,
@@ -158,15 +130,9 @@ def build_trainer(
         optimizer=optimizer,
         loss_function=loss,
         inferer=SimpleInferer(),
-        # post_transform=train_post_transform,
-        # key_train_metric={
-        #     "train_mean_dice": MeanDice(
-        #         include_background=False,
-        #         output_transform=lambda x: (x["pred"], x["label"]),
-        #     )
-        # },
         train_handlers=train_handlers,
-        # amp=fp16,
+        scaler=scaler,
+        clip_max_norm=float(getattr(config.TRAIN, "CLIP_MAX_NORM", 0.1)),
     )
 
     patience = getattr(config.TRAIN, "EARLY_STOPPING_PATIENCE", None)
