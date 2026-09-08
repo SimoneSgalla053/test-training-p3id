@@ -39,6 +39,18 @@ parser.add_argument(
 parser.add_argument(
     "--num_visualizations", type=int, default=10, help="number of test graph comparisons to save."
 )
+parser.add_argument(
+    "--max_samples",
+    type=int,
+    default=None,
+    help="maximum number of test samples to evaluate; evaluates the full test set by default.",
+)
+parser.add_argument(
+    "--batch_size",
+    type=int,
+    default=None,
+    help="test data-loader batch size; uses the configured batch size by default.",
+)
 
 
 class obj:
@@ -57,6 +69,17 @@ def ensure_format(bboxes):
         if bbox[1] > bbox[3]:
             bbox[1], bbox[3] = bbox[3], bbox[1]
     return bboxes
+
+
+def edges_to_boxes(nodes, edges, pad=0.01):
+    """Axis-aligned boxes around edges; padded so axis-parallel lines have nonzero area."""
+    if len(edges) == 0:
+        return np.zeros((0, 4), dtype=np.float32)
+    edges = np.asarray(edges, dtype=np.int64)
+    boxes = ensure_format(np.hstack([nodes[edges[:, 0]], nodes[edges[:, 1]]]).astype(np.float32))
+    boxes[:, :2] -= pad
+    boxes[:, 2:] += pad
+    return boxes
 
 
 def plot_val_rel_sample(
@@ -201,11 +224,18 @@ def test(args):
     net = build_model(config).to(device)
 
     test_ds = build_road_network_data(config, mode="test")
+    if args.max_samples is not None:
+        if args.max_samples <= 0:
+            raise ValueError("--max_samples must be greater than zero.")
+        test_ds = torch.utils.data.Subset(test_ds, range(min(args.max_samples, len(test_ds))))
+    batch_size = args.batch_size or config.DATA.BATCH_SIZE
+    if batch_size <= 0:
+        raise ValueError("--batch_size must be greater than zero.")
 
     test_loader = DataLoader(
         test_ds,
-        batch_size=config.DATA.BATCH_SIZE,
-        shuffle=True,
+        batch_size=batch_size,
+        shuffle=False,
         num_workers=config.DATA.NUM_WORKERS,
         collate_fn=image_graph_collate_road_network,
         pin_memory=True,
@@ -263,7 +293,7 @@ def test(args):
                 net,
                 config.MODEL.DECODER.OBJ_TOKEN,
                 config.MODEL.DECODER.RLN_TOKEN,
-                nms=False,
+                nms=config.INFERENCE.NMS,
                 map_=True,
                 node_threshold=config.INFERENCE.NODE_THRESHOLD,
                 edge_threshold=config.INFERENCE.EDGE_THRESHOLD,
@@ -301,17 +331,14 @@ def test(args):
             )
 
             # Add elements of current batch elem to edge map evaluator
-            pred_edges_box = []
-            for edges_, nodes_ in zip(pred_edges, pred_nodes):
-                nodes_ = nodes_.cpu().numpy()
-                edges_box = ensure_format(np.hstack([nodes_[edges_[:, 0]], nodes_[edges_[:, 1]]]))
-                pred_edges_box.append(edges_box)
-
-            gt_edges_box = []
-            for edges_, nodes_ in zip(edges, nodes):
-                nodes_, edges_ = nodes_.cpu().numpy(), edges_.cpu().numpy()
-                edges_box = ensure_format(np.hstack([nodes_[edges_[:, 0]], nodes_[edges_[:, 1]]]))
-                gt_edges_box.append(edges_box)
+            pred_edges_box = [
+                edges_to_boxes(nodes_.cpu().numpy(), edges_)
+                for edges_, nodes_ in zip(pred_edges, pred_nodes)
+            ]
+            gt_edges_box = [
+                edges_to_boxes(nodes_.cpu().numpy(), edges_.cpu().numpy())
+                for edges_, nodes_ in zip(edges, nodes)
+            ]
 
             metric_edge_map.add(
                 pred_boxes=pred_edges_box,
