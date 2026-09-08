@@ -45,7 +45,10 @@ def ms_deform_attn_core_pytorch(value, value_spatial_shapes, sampling_locations,
     _, Lq_, M_, L_, P_, _ = sampling_locations.shape
     value_list = value.split([H_ * W_ for H_, W_ in value_spatial_shapes], dim=1)
     sampling_grids = 2 * sampling_locations - 1
-    sampling_value_list = []
+    # (N_, Lq_, M_, L_, P_) -> (N_*M_, 1, Lq_, L_, P_)
+    attention_weights = attention_weights.transpose(1, 2).reshape(N_*M_, 1, Lq_, L_, P_)
+    # accumulate per level: stacking all levels first costs N*M*D*Lq*L*P floats at once
+    output = None
     for lid_, (H_, W_) in enumerate(value_spatial_shapes):
         # N_, H_*W_, M_, D_ -> N_, H_*W_, M_*D_ -> N_, M_*D_, H_*W_ -> N_*M_, D_, H_, W_
         value_l_ = value_list[lid_].flatten(2).transpose(1, 2).reshape(N_*M_, D_, H_, W_)
@@ -54,8 +57,7 @@ def ms_deform_attn_core_pytorch(value, value_spatial_shapes, sampling_locations,
         # N_*M_, D_, Lq_, P_
         sampling_value_l_ = F.grid_sample(value_l_, sampling_grid_l_,
                                           mode='bilinear', padding_mode='zeros', align_corners=False)
-        sampling_value_list.append(sampling_value_l_)
-    # (N_, Lq_, M_, L_, P_) -> (N_, M_, Lq_, L_, P_) -> (N_, M_, 1, Lq_, L_*P_)
-    attention_weights = attention_weights.transpose(1, 2).reshape(N_*M_, 1, Lq_, L_*P_)
-    output = (torch.stack(sampling_value_list, dim=-2).flatten(-2) * attention_weights).sum(-1).view(N_, M_*D_, Lq_)
+        weighted_l_ = (sampling_value_l_ * attention_weights[..., lid_, :]).sum(-1)
+        output = weighted_l_ if output is None else output + weighted_l_
+    output = output.view(N_, M_*D_, Lq_)
     return output.transpose(1, 2).contiguous()

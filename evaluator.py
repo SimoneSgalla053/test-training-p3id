@@ -1,9 +1,9 @@
 import os
-import gc
 from pathlib import Path
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
+import ignite.distributed as idist
 from monai.engines import SupervisedEvaluator
 from monai.handlers import StatsHandler, CheckpointSaver, TensorBoardStatsHandler
 from metric_smd import MeanSMD
@@ -86,33 +86,37 @@ class RelationformerEvaluator(SupervisedEvaluator):
         )
 
         self.config = kwargs.pop("config")
+        self.use_amp = kwargs.pop("use_amp", False)
         self.last_visualization_epoch = None
 
     def _iteration(self, engine, batchdata):
         images, nodes, edges = batchdata[0], batchdata[1], batchdata[2]
 
-        # # inputs, targets = self.get_batch(batchdata, image_keys=IMAGE_KEYS, label_keys="label")
-        # # inputs = torch.cat(inputs, 1)
-        images = images.to(engine.state.device, non_blocking=False)
-        nodes = [node.to(engine.state.device, non_blocking=False) for node in nodes]
-        edges = [edge.to(engine.state.device, non_blocking=False) for edge in edges]
+        images = images.to(engine.state.device, non_blocking=True)
+        nodes = [node.to(engine.state.device, non_blocking=True) for node in nodes]
+        edges = [edge.to(engine.state.device, non_blocking=True) for edge in edges]
 
         self.network.eval()
 
-        h, out = self.network(images)
+        with torch.no_grad(), torch.autocast("cuda", dtype=torch.float16, enabled=self.use_amp):
+            h, out = self.network(images)
 
-        pred_nodes, pred_edges = relation_infer(
-            h.detach(),
-            out,
-            self.network,
-            self.config.MODEL.DECODER.OBJ_TOKEN,
-            self.config.MODEL.DECODER.RLN_TOKEN,
-            nms=getattr(self.config.INFERENCE, "NMS", False),
-            node_threshold=self.config.INFERENCE.NODE_THRESHOLD,
-            edge_threshold=self.config.INFERENCE.EDGE_THRESHOLD,
-        )
+            pred_nodes, pred_edges = relation_infer(
+                h,
+                out,
+                self.network,
+                self.config.MODEL.DECODER.OBJ_TOKEN,
+                self.config.MODEL.DECODER.RLN_TOKEN,
+                nms=getattr(self.config.INFERENCE, "NMS", False),
+                node_threshold=self.config.INFERENCE.NODE_THRESHOLD,
+                edge_threshold=self.config.INFERENCE.EDGE_THRESHOLD,
+            )
 
-        if self.config.TRAIN.SAVE_VAL and self.last_visualization_epoch != engine.state.epoch:
+        if (
+            self.config.TRAIN.SAVE_VAL
+            and idist.get_rank() == 0
+            and self.last_visualization_epoch != engine.state.epoch
+        ):
             save_graph_comparison(
                 images[0],
                 nodes[0],
@@ -126,19 +130,6 @@ class RelationformerEvaluator(SupervisedEvaluator):
             )
             self.last_visualization_epoch = engine.state.epoch
 
-        # if self.config.TRAIN.SAVE_VAL:
-        #     root_path = os.path.join(self.config.TRAIN.SAVE_PATH, "runs", '%s_%d' % (self.config.log.exp_name, self.config.DATA.SEED), 'val_samples')
-        #     if not os.path.exists(root_path):
-        #         os.makedirs(root_path)
-        #     for i, (node, edge, pred_node, pred_edge) in enumerate(zip(nodes, edges, pred_nodes, pred_edges)):
-        #         path = os.path.join(root_path, "ref_epoch_"+str(engine.state.epoch).zfill(3)+"_iteration_"+str(engine.state.iteration).zfill(5))
-        #         save_input(path, i, images[i,0,...].cpu().numpy(), node.cpu().numpy(), edge.cpu().numpy())
-        #         path = os.path.join(root_path, "pred_epoch_"+str(engine.state.epoch).zfill(3)+"_iteration_"+str(engine.state.iteration).zfill(5))
-        #         save_output(path, i, pred_node.cpu().numpy(), pred_edge.cpu().numpy())
-
-        gc.collect()
-        torch.cuda.empty_cache()
-
         return {
             "images": images,
             "nodes": nodes,
@@ -148,54 +139,44 @@ class RelationformerEvaluator(SupervisedEvaluator):
         }
 
 
-def build_evaluator(val_loader, net, optimizer, scheduler, writer, config, device):
-    """[summary]
-
-    Args:
-        val_loader ([type]): [description]
-        net ([type]): [description]
-        device ([type]): [description]
-
-    Returns:
-        [type]: [description]
-    """
-    val_handlers = [
-        StatsHandler(output_transform=lambda x: None),
-        CheckpointSaver(
-            save_dir=os.path.join(
-                config.TRAIN.SAVE_PATH,
-                "runs",
-                "%s_%d" % (config.log.exp_name, config.DATA.SEED),
-                "models",
+def build_evaluator(val_loader, net, optimizer, scheduler, scaler, writer, config, device, use_amp=False):
+    val_handlers = []
+    if idist.get_rank() == 0:
+        val_handlers = [
+            StatsHandler(output_transform=lambda x: None),
+            CheckpointSaver(
+                save_dir=os.path.join(
+                    config.TRAIN.SAVE_PATH,
+                    "runs",
+                    "%s_%d" % (config.log.exp_name, config.DATA.SEED),
+                    "models",
+                ),
+                save_dict={
+                    "net": net,
+                    "optimizer": optimizer,
+                    "scheduler": scheduler,
+                    "scaler": scaler,
+                },
+                save_key_metric=True,
+                key_metric_n_saved=5,
+                save_interval=1,
+                key_metric_negative_sign=True,
             ),
-            save_dict={"net": net, "optimizer": optimizer, "scheduler": scheduler},
-            save_key_metric=True,
-            key_metric_n_saved=5,
-            save_interval=1,
-            key_metric_negative_sign=True,
-        ),
-        TensorBoardStatsHandler(
-            writer,
-            tag_name="val_smd",
-            output_transform=lambda x: None,
-            global_epoch_transform=lambda x: scheduler.last_epoch,
-        ),
-    ]
-
-    # val_post_transform = Compose(
-    #     [AsDiscreted(keys=("pred", "label"),
-    #     argmax=(True, False),
-    #     to_onehot=True,
-    #     n_classes=N_CLASS)]
-    # )
+            TensorBoardStatsHandler(
+                writer,
+                tag_name="val_smd",
+                output_transform=lambda x: None,
+                global_epoch_transform=lambda x: scheduler.last_epoch,
+            ),
+        ]
 
     evaluator = RelationformerEvaluator(
         config=config,
+        use_amp=use_amp,
         device=device,
         val_data_loader=val_loader,
         network=net,
         inferer=SimpleInferer(),
-        # post_transform=val_post_transform,
         key_val_metric={
             "val_smd": MeanSMD(
                 output_transform=lambda x: (

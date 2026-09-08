@@ -76,6 +76,9 @@ class SetCriterion(nn.Module):
         self.rln_token = config.MODEL.DECODER.RLN_TOKEN
         self.obj_token = config.MODEL.DECODER.OBJ_TOKEN
         self.randomize_edge_directions = config.TRAIN.RANDOMIZE_EDGE_DIRECTIONS
+        self.max_pos_edges = getattr(config.TRAIN, "MAX_POS_EDGES", None)
+        self.neg_edge_ratio = getattr(config.TRAIN, "NEG_EDGE_RATIO", 4)
+        self.min_neg_edges = getattr(config.TRAIN, "MIN_NEG_EDGES", 20)
         self.losses = config.TRAIN.LOSSES
         self.weight_dict = {
             "boxes": config.TRAIN.W_BBOX,
@@ -90,7 +93,7 @@ class SetCriterion(nn.Module):
         targets dicts must contain the key "boxes" containing a tensor of dim [nb_target_boxes, 4]
         The target boxes are expected in format (center_x, center_y, w, h), normalized by the image size.
         """
-        weight = torch.tensor([0.2, 0.8]).to(outputs.get_device())
+        weight = torch.tensor([0.2, 0.8]).to(outputs.device)
 
         idx = self._get_src_permutation_idx(indices)
 
@@ -103,7 +106,7 @@ class SetCriterion(nn.Module):
         # # loss = F.cross_entropy(outputs.permute(0,2,1), targets, weight=weight, reduction='mean')
         # loss = sigmoid_focal_loss(outputs, targets, num_nodes)
 
-        targets = torch.zeros(outputs[..., 0].shape, dtype=torch.long).to(outputs.get_device())
+        targets = torch.zeros(outputs[..., 0].shape, dtype=torch.long).to(outputs.device)
         targets[idx] = 1.0
         loss = F.cross_entropy(outputs.permute(0, 2, 1), targets, weight=weight, reduction="mean")
 
@@ -115,7 +118,7 @@ class SetCriterion(nn.Module):
         This is not really a loss, it is intended for logging purposes only. It doesn't propagate gradients
         """
         idx = self._get_src_permutation_idx(indices)
-        targets = torch.zeros(outputs[..., 0].shape, dtype=torch.long).to(outputs.get_device())
+        targets = torch.zeros(outputs[..., 0].shape, dtype=torch.long).to(outputs.device)
         targets[idx] = 1.0
 
         tgt_lengths = torch.as_tensor([t.sum() for t in targets], device=outputs.device)
@@ -170,136 +173,72 @@ class SetCriterion(nn.Module):
         loss = loss.sum() / num_boxes
         return loss
 
-    def loss_edges(self, h, target_nodes, target_edges, indices, num_edges=40):
-        """Compute the losses related to the masks: the focal loss and the dice loss.
-        targets dicts must contain the key "masks" containing a tensor of dim [nb_target_boxes, h, w]
-        """
-        try:
-            # all token except the last one is object token
-            object_token = h[..., : self.obj_token, :]
+    def loss_edges(self, h, target_nodes, target_edges, indices):
+        """Relation loss on all ground-truth edges plus randomly sampled negative pairs."""
+        object_token = h[..., : self.obj_token, :]
+        if self.rln_token > 0:
+            relation_token = h[..., self.obj_token : self.rln_token + self.obj_token, :]
 
-            # last token is relation token
+        edge_labels = []
+        relation_feature = []
+        for batch_id, (edges, (src_idx, tgt_idx)) in enumerate(zip(target_edges, indices)):
+            # object tokens in matcher order; position k corresponds to GT node tgt_idx[k]
+            rearranged_object_token = object_token[batch_id, src_idx, :]
+            matched_node_count = rearranged_object_token.shape[0]
+
+            # remap GT node ids -> matched position, dropping edges touching unmatched nodes
+            edges = edges.cpu()
+            remap = torch.full((int(edges.max()) + 1 if edges.numel() else 1,), -1, dtype=torch.long)
+            remap[tgt_idx] = torch.arange(matched_node_count)
+            pos_edge = remap[edges]
+            pos_edge = pos_edge[(pos_edge >= 0).all(1)]
+
+            full_adj = torch.ones((matched_node_count, matched_node_count)) - torch.eye(
+                matched_node_count
+            )
+            full_adj[pos_edge[:, 0], pos_edge[:, 1]] = 0
+            full_adj[pos_edge[:, 1], pos_edge[:, 0]] = 0
+            neg_edges = torch.nonzero(torch.triu(full_adj))
+
+            if self.max_pos_edges is not None and pos_edge.shape[0] > self.max_pos_edges:
+                pos_edge = pos_edge[torch.randperm(pos_edge.shape[0])[: self.max_pos_edges]]
+
+            take_neg = min(
+                neg_edges.shape[0],
+                max(self.neg_edge_ratio * pos_edge.shape[0], self.min_neg_edges),
+            )
+            neg_edges = neg_edges[torch.randperm(neg_edges.shape[0])[:take_neg]]
+
+            all_edges_ = torch.cat((pos_edge, neg_edges), 0)
+            if self.randomize_edge_directions:
+                flip = torch.rand(all_edges_.shape[0]) > 0.5
+                all_edges_[flip] = all_edges_[flip][:, [1, 0]]
+            all_edges_ = all_edges_.to(h.device)
+
+            edge_labels.append(
+                torch.cat(
+                    (
+                        torch.ones(pos_edge.shape[0], dtype=torch.long),
+                        torch.zeros(take_neg, dtype=torch.long),
+                    ),
+                    0,
+                )
+            )
+
+            feature_parts = [
+                rearranged_object_token[all_edges_[:, 0], :],
+                rearranged_object_token[all_edges_[:, 1], :],
+            ]
             if self.rln_token > 0:
-                relation_token = h[..., self.obj_token : self.rln_token + self.obj_token, :]
-
-            # map the ground truth edge indices by the matcher ordering
-            target_edges = [
-                [t for t in tgt if t[0].cpu() in i and t[1].cpu() in i]
-                for tgt, (_, i) in zip(target_edges, indices)
-            ]
-            target_edges = [
-                (
-                    torch.stack(t, 0)
-                    if len(t) > 0
-                    else torch.zeros((0, 2), dtype=torch.long).to(h.device)
+                feature_parts.append(
+                    relation_token[batch_id, ...].repeat(all_edges_.shape[0], 1)
                 )
-                for t in target_edges
-            ]
+            relation_feature.append(torch.cat(feature_parts, 1))
 
-            new_target_edges = []
-            for t, (_, i) in zip(target_edges, indices):
-                tx = t.clone().detach()
-                for idx, k in enumerate(i):
-                    t[tx == k] = idx
-                new_target_edges.append(t)
-
-            # all_edges = []
-            edge_labels = []
-            relation_feature = []
-
-            # loop through each of batch to collect the edge and node
-            for batch_id, pos_edge in enumerate(new_target_edges):
-
-                # map the predicted object token by the matcher ordering
-                rearranged_object_token = object_token[batch_id, indices[batch_id][0], :]
-
-                # find the -ve edges for training
-                matched_node_count = rearranged_object_token.shape[0]
-                full_adj = torch.ones((matched_node_count, matched_node_count)) - torch.diag(
-                    torch.ones(matched_node_count)
-                )
-                full_adj[pos_edge[:, 0], pos_edge[:, 1]] = 0
-                full_adj[pos_edge[:, 1], pos_edge[:, 0]] = 0
-                neg_edges = torch.nonzero(torch.triu(full_adj))
-
-                if self.randomize_edge_directions:
-                    shuffle = np.random.randn((pos_edge.shape[0])) > 0
-                    to_shuffle = pos_edge[shuffle, :]
-                    pos_edge[shuffle, :] = to_shuffle[:, [1, 0]]
-
-                # restrict unbalance in the +ve/-ve edge
-                if pos_edge.shape[0] > 20:
-                    # print('Reshaping')
-                    pos_edge = pos_edge[:20, :]
-
-                # random sample -ve edge
-                idx_ = torch.randperm(neg_edges.shape[0])
-                neg_edges = neg_edges[idx_, :].to(pos_edge.device)
-
-                if self.randomize_edge_directions:
-                    shuffle = np.random.randn((neg_edges.shape[0])) > 0
-                    to_shuffle = neg_edges[shuffle, :]
-                    neg_edges[shuffle, :] = to_shuffle[:, [1, 0]]
-
-                # check whether the number of -ve edges are within limit
-                if num_edges - pos_edge.shape[0] < neg_edges.shape[0]:
-                    take_neg = num_edges - pos_edge.shape[0]
-                    total_edge = num_edges
-                else:
-                    take_neg = neg_edges.shape[0]
-                    total_edge = pos_edge.shape[0] + neg_edges.shape[0]
-                all_edges_ = torch.cat((pos_edge, neg_edges[:take_neg]), 0)
-                # all_edges.append(all_edges_)
-                edge_labels.append(
-                    torch.cat(
-                        (
-                            torch.ones(pos_edge.shape[0], dtype=torch.long),
-                            torch.zeros(take_neg, dtype=torch.long),
-                        ),
-                        0,
-                    )
-                )
-
-                # concatenate object token pairs with relation token
-                if self.rln_token > 0:
-                    relation_feature.append(
-                        torch.cat(
-                            (
-                                rearranged_object_token[all_edges_[:, 0], :],
-                                rearranged_object_token[all_edges_[:, 1], :],
-                                relation_token[batch_id, ...].repeat(total_edge, 1),
-                            ),
-                            1,
-                        )
-                    )
-                else:
-                    relation_feature.append(
-                        torch.cat(
-                            (
-                                rearranged_object_token[all_edges_[:, 0], :],
-                                rearranged_object_token[all_edges_[:, 1], :],
-                            ),
-                            1,
-                        )
-                    )
-
-            # [print(e,l) for e,l in zip(all_edges, edge_labels)]
-
-            # torch.tensor(list(itertools.combinations(range(n.shape[0]), 2))).to(e.get_device())
-            relation_feature = torch.cat(relation_feature, 0)
-            edge_labels = torch.cat(edge_labels, 0).to(h.get_device())
-
-            relation_pred = self.net.relation_embed(relation_feature)
-
-            # valid_edges = torch.argmax(relation_pred, -1)
-            # print('valid_edge number', valid_edges.sum())
-
-            loss = F.cross_entropy(relation_pred, edge_labels, reduction="mean")
-        except Exception as e:
-            print(e)
-            pdb.set_trace()
-
-        return loss
+        relation_feature = torch.cat(relation_feature, 0)
+        edge_labels = torch.cat(edge_labels, 0).to(h.device)
+        relation_pred = self.net.relation_embed(relation_feature)
+        return F.cross_entropy(relation_pred, edge_labels, reduction="mean")
 
     def _get_src_permutation_idx(self, indices):
         # permute predictions following indices

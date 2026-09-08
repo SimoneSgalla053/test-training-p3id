@@ -12,13 +12,20 @@ from __future__ import division
 
 import warnings
 import math
+import inspect
 
 import torch
 from torch import nn
 import torch.nn.functional as F
 from torch.nn.init import xavier_uniform_, constant_
+from torch.utils.checkpoint import checkpoint
 
 from ..functions.ms_deform_attn_func import ms_deform_attn_core_pytorch
+
+# use_reentrant only exists from torch 1.11
+_CHECKPOINT_KWARGS = (
+    {"use_reentrant": False} if "use_reentrant" in inspect.signature(checkpoint).parameters else {}
+)
 
 
 def _is_power_of_2(n):
@@ -95,9 +102,11 @@ class MSDeformAttn(nn.Module):
         if input_padding_mask is not None:
             value = value.masked_fill(input_padding_mask[..., None], float(0))
         value = value.view(N, Len_in, self.n_heads, self.d_model // self.n_heads)
-        sampling_offsets = self.sampling_offsets(query).view(N, Len_q, self.n_heads, self.n_levels, self.n_points, 2)
-        attention_weights = self.attention_weights(query).view(N, Len_q, self.n_heads, self.n_levels * self.n_points)
+        # sampling coordinates need fp32 resolution under autocast
+        sampling_offsets = self.sampling_offsets(query).float().view(N, Len_q, self.n_heads, self.n_levels, self.n_points, 2)
+        attention_weights = self.attention_weights(query).float().view(N, Len_q, self.n_heads, self.n_levels * self.n_points)
         attention_weights = F.softmax(attention_weights, -1).view(N, Len_q, self.n_heads, self.n_levels, self.n_points)
+        reference_points = reference_points.float()
         # N, Len_q, n_heads, n_levels, n_points, 2
         if reference_points.shape[-1] == 2:
             offset_normalizer = torch.stack([input_spatial_shapes[..., 1], input_spatial_shapes[..., 0]], -1)
@@ -111,7 +120,14 @@ class MSDeformAttn(nn.Module):
                 'Last dim of reference_points must be 2 or 4, but get {} instead.'.format(reference_points.shape[-1]))
         # output = MSDeformAttnFunction.apply(
         #     value, input_spatial_shapes, input_level_start_index, sampling_locations, attention_weights, self.im2col_step)
-        output = ms_deform_attn_core_pytorch(value, input_spatial_shapes, sampling_locations, attention_weights)
+        if self.training and torch.is_grad_enabled():
+            # the sampled values (N*heads*D*Lq*L*P) dominate activation memory; recompute them in backward
+            output = checkpoint(
+                ms_deform_attn_core_pytorch, value, input_spatial_shapes, sampling_locations, attention_weights,
+                **_CHECKPOINT_KWARGS,
+            )
+        else:
+            output = ms_deform_attn_core_pytorch(value, input_spatial_shapes, sampling_locations, attention_weights)
         
         output = self.output_proj(output)
         return output
