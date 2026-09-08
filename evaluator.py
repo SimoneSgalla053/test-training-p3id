@@ -90,10 +90,10 @@ class RelationformerEvaluator(SupervisedEvaluator):
         self.last_visualization_epoch = None
 
     def _iteration(self, engine, batchdata):
-        images, nodes, edges = batchdata[0], batchdata[1], batchdata[2]
+        images, boxes, edges = batchdata[0], batchdata[1], batchdata[3]
 
         images = images.to(engine.state.device, non_blocking=True)
-        nodes = [node.to(engine.state.device, non_blocking=True) for node in nodes]
+        boxes = [box.to(engine.state.device, non_blocking=True) for box in boxes]
         edges = [edge.to(engine.state.device, non_blocking=True) for edge in edges]
 
         self.network.eval()
@@ -119,7 +119,7 @@ class RelationformerEvaluator(SupervisedEvaluator):
         ):
             save_graph_comparison(
                 images[0],
-                nodes[0],
+                boxes[0][..., :2],
                 edges[0],
                 pred_nodes[0],
                 pred_edges[0],
@@ -132,7 +132,7 @@ class RelationformerEvaluator(SupervisedEvaluator):
 
         return {
             "images": images,
-            "nodes": nodes,
+            "nodes": [box[..., :2] for box in boxes],
             "edges": edges,
             "pred_nodes": pred_nodes,
             "pred_edges": pred_edges,

@@ -77,15 +77,21 @@ class RelationformerTrainer(SupervisedTrainer):
         self.clip_max_norm = clip_max_norm
 
     def _iteration(self, engine, batchdata):
-        images, nodes, edges = batchdata[0], batchdata[1], batchdata[2]
-        ids = batchdata[3]
+        images, nodes, node_labels, edges, edge_labels = batchdata[:5]
 
         # inputs, targets = self.get_batch(batchdata, image_keys=IMAGE_KEYS, label_keys="label")
         # inputs = torch.cat(inputs, 1)
         images = images.to(engine.state.device, non_blocking=True)
         nodes = [node.to(engine.state.device, non_blocking=True) for node in nodes]
+        node_labels = [label.to(engine.state.device, non_blocking=True) for label in node_labels]
         edges = [edge.to(engine.state.device, non_blocking=True) for edge in edges]
-        target = {"nodes": nodes, "edges": edges}
+        edge_labels = [label.to(engine.state.device, non_blocking=True) for label in edge_labels]
+        target = {
+            "nodes": nodes,
+            "node_labels": node_labels,
+            "edges": edges,
+            "edge_labels": edge_labels,
+        }
 
         self.network.train()
         self.optimizer.zero_grad(set_to_none=True)

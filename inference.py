@@ -23,7 +23,8 @@ def relation_infer(
         relation_token = h[..., obj_token : obj_token + rln_token, :]
 
     # Keep nodes only when the positive-class probability clears the configured threshold.
-    node_scores = out["pred_logits"].softmax(-1)[..., 1].detach()
+    node_scores, node_classes = out["pred_logits"].softmax(-1)[..., 1:].detach().max(-1)
+    node_classes = node_classes + 1
     valid_token = node_scores >= node_threshold
 
     # apply nms on valid tokens
@@ -35,7 +36,7 @@ def relation_infer(
             valid_token_id = torch.nonzero(token).squeeze(1)
 
             valid_logits, valid_nodes = logits[valid_token_id], nodes[valid_token_id]
-            valid_scores = F.softmax(valid_logits, dim=1)[:, 1]
+            valid_scores, valid_classes = F.softmax(valid_logits, dim=1)[:, 1:].max(1)
 
             # 0 <= x1 < x2 and 0 <= y1 < y2 has to be fulfilled
             valid_nodes[:, 2:] = valid_nodes[:, :2] + 0.5
@@ -43,7 +44,7 @@ def relation_infer(
             ids2keep = batched_nms(
                 boxes=valid_nodes * 1000,
                 scores=valid_scores,
-                idxs=torch.ones_like(valid_scores, dtype=torch.long),
+                idxs=valid_classes,
                 iou_threshold=0.90,
             )
             valid_token_id_nms = valid_token_id[ids2keep].sort()[0]
@@ -73,9 +74,9 @@ def relation_infer(
         if map_:
             pred_nodes_boxes.append(out["pred_nodes"][batch_id, node_id, :].detach().cpu().numpy())
             pred_nodes_boxes_score.append(
-                out["pred_logits"].softmax(-1)[batch_id, node_id, 1].detach().cpu().numpy()
-            )  # TODO: generalize over multi-class
-            pred_nodes_boxes_class.append(valid_token[batch_id, node_id].long().cpu().numpy())
+                node_scores[batch_id, node_id].cpu().numpy()
+            )
+            pred_nodes_boxes_class.append(node_classes[batch_id, node_id].cpu().numpy())
 
         if node_id.dim() != 0 and node_id.nelement() != 0 and node_id.shape[0] > 1:
 
@@ -126,13 +127,14 @@ def relation_infer(
             relation_pred2 = model.relation_embed(relation_feature2).detach()
             relation_pred = (relation_pred1 + relation_pred2) / 2.0
 
-            edge_scores = relation_pred.softmax(-1)[:, 1]
+            edge_scores, edge_classes = relation_pred.softmax(-1)[:, 1:].max(1)
+            edge_classes = edge_classes + 1
             pred_rel = torch.nonzero(edge_scores >= edge_threshold).squeeze(1).cpu().numpy()
             pred_edges.append(node_pairs_valid[pred_rel].cpu().numpy())
 
             if map_:
                 pred_edges_boxes_score.append(edge_scores[pred_rel].cpu().numpy())
-                pred_edges_boxes_class.append(torch.ones(len(pred_rel), dtype=torch.long).numpy())
+                pred_edges_boxes_class.append(edge_classes[pred_rel].cpu().numpy())
         else:
             pred_edges.append(torch.empty(0, 2))
 

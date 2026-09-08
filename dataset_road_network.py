@@ -18,6 +18,22 @@ from pathlib import Path
 from xml.etree import ElementTree
 
 
+PID_NODE_CLASSES = {
+    "general": 1,
+    "tank": 2,
+    "valve": 3,
+    "instrumentation": 4,
+    "pump": 5,
+    "inlet/outlet": 6,
+    "arrow": 7,
+    "crossing": 8,
+    "connector": 9,
+    "border": 10,
+}
+PID_EDGE_CLASSES = {"solid": 1, "non-solid": 2}
+PID_CACHE_VERSION = 2
+
+
 class ToulouseRoadNetworkDataset(Dataset):
     """
     Generates a subclass of the PyTorch torch.utils.data.Dataset class
@@ -75,9 +91,9 @@ class PatchedPIDDataset(Dataset):
     """Loads patched P&ID PNG images and their paired GraphML annotations."""
 
     SPLIT_RANGES = {
-        "train": (0, 80),
-        "valid": (80, 90),
-        "test": (90, 100),
+        "train": (0, 95),
+        "valid": (95, 100),
+        "test": (0, 100),
     }
 
     def __init__(
@@ -105,7 +121,7 @@ class PatchedPIDDataset(Dataset):
 
         self.ids = [sample_id for _, _, sample_id in samples]
         cache_key = hashlib.sha1(
-            f"{root.resolve()}:{split_seed}:{max_nodes}:{split}:{self.image_size}".encode()
+            f"{PID_CACHE_VERSION}:{root.resolve()}:{split_seed}:{max_nodes}:{split}:{self.image_size}".encode()
         ).hexdigest()[:16]
         self.images, self.graphs = preprocess_pid_samples(
             samples, self.image_size, cache_dir / f"pid_{cache_key}_{split}"
@@ -118,8 +134,8 @@ class PatchedPIDDataset(Dataset):
 
     def __getitem__(self, idx):
         image = torch.from_numpy(np.array(self.images[idx])).float().div_(255)
-        nodes, edges = self.graphs[idx]
-        return image[None, None], nodes, edges, self.ids[idx]
+        boxes, node_labels, edges, edge_labels = self.graphs[idx]
+        return image[None, None], boxes, node_labels, edges, edge_labels, self.ids[idx]
 
 
 def resolve_cache_dir(cache_dir=None):
@@ -142,15 +158,15 @@ def _preprocess_pid_sample(job):
         width, height = image.size
         resized = image.convert("L").resize(_WORKER_IMAGE_SIZE, Image.BILINEAR)
         _WORKER_IMAGES[index] = np.asarray(resized, dtype=np.uint8)
-    nodes, edges = load_pid_graph(graph_path, width, height)
-    return index, nodes, edges
+    graph = load_pid_graph(graph_path, width, height)
+    return (index, *graph)
 
 
 def preprocess_pid_samples(samples, image_size, cache_prefix, num_workers=None):
     """Decodes/resizes every image into a uint8 memmap and parses graphs to tensors, once.
 
-    Returns (images memmap [N, H, W], list of (nodes, edges)). The graphs pickle is written
-    last and doubles as the completion marker for the image memmap.
+    Returns an image memmap and a list of (boxes, node labels, edges, edge labels).
+    The graphs pickle is written last and doubles as the completion marker.
     """
     images_path = Path(f"{cache_prefix}_images.npy")
     graphs_path = Path(f"{cache_prefix}_graphs.pickle")
@@ -182,10 +198,10 @@ def preprocess_pid_samples(samples, image_size, cache_prefix, num_workers=None):
     with Pool(
         num_workers, initializer=_init_pid_worker, initargs=(str(images_path), tuple(image_size))
     ) as pool:
-        for done, (index, nodes, edges) in enumerate(
+        for done, (index, boxes, node_labels, edges, edge_labels) in enumerate(
             pool.imap_unordered(_preprocess_pid_sample, jobs, chunksize=64), 1
         ):
-            graphs[index] = (nodes, edges)
+            graphs[index] = (boxes, node_labels, edges, edge_labels)
             if done % 5000 == 0:
                 print(f"  {done}/{len(samples)} samples preprocessed ({time.time() - start_time:.0f}s)")
 
@@ -204,7 +220,9 @@ def index_pid_samples(root, split_seed, max_nodes, cache_dir=None):
     """
     root = Path(root)
     cache_dir = resolve_cache_dir(cache_dir)
-    cache_key = hashlib.sha1(f"{root.resolve()}:{split_seed}:{max_nodes}".encode()).hexdigest()[:16]
+    cache_key = hashlib.sha1(
+        f"{PID_CACHE_VERSION}:{root.resolve()}:{split_seed}:{max_nodes}".encode()
+    ).hexdigest()[:16]
     cache_path = cache_dir / f"pid_index_{cache_key}.pickle"
 
     if cache_path.is_file():
@@ -228,21 +246,22 @@ def index_pid_samples(root, split_seed, max_nodes, cache_dir=None):
         if not image_path.is_file():
             continue
 
-        sample_key = graph_path.relative_to(root).as_posix()
-        split_value = int(hashlib.sha1(f"{split_seed}:{sample_key}".encode()).hexdigest(), 16) % 100
-        for split, (split_start, split_end) in PatchedPIDDataset.SPLIT_RANGES.items():
-            if split_start <= split_value < split_end:
-                if is_trainable_pid_graph(graph_path, max_nodes=max_nodes):
-                    splits[split].append(
-                        (
-                            image_path.relative_to(root).as_posix(),
-                            graph_path.relative_to(root).as_posix(),
-                            graph_path.relative_to(root).with_suffix("").as_posix(),
-                        )
-                    )
-                else:
-                    skipped_graphs += 1
-                break
+        relative_path = graph_path.relative_to(root)
+        drawing_key = relative_path.parent.as_posix()
+        split_value = int(
+            hashlib.sha1(f"{split_seed}:{drawing_key}".encode()).hexdigest(), 16
+        ) % 100
+        if is_trainable_pid_graph(graph_path, max_nodes=max_nodes):
+            sample = (
+                image_path.relative_to(root).as_posix(),
+                graph_path.relative_to(root).as_posix(),
+                graph_path.relative_to(root).with_suffix("").as_posix(),
+            )
+            split = "train" if split_value < PatchedPIDDataset.SPLIT_RANGES["train"][1] else "valid"
+            splits[split].append(sample)
+            splits["test"].append(sample)
+        else:
+            skipped_graphs += 1
 
         if index % 5000 == 0:
             print(f"  {index}/{len(graph_paths)} graphs processed ({time.time() - start_time:.0f}s)")
@@ -264,15 +283,18 @@ def index_pid_samples(root, split_seed, max_nodes, cache_dir=None):
 
 
 def load_pid_graph(graph_path, width, height):
-    """Converts GraphML bounding boxes to normalized node centers and edge indices.
+    """Converts GraphML annotations to normalized boxes, class labels and typed edges.
 
     Nodes that take part in no edge are dropped, since only line connectivity is learned.
     """
     namespace = "{http://graphml.graphdrawing.org/xmlns}"
     graph = ElementTree.parse(graph_path).getroot().find(f"{namespace}graph")
-    node_centers = {}
+    node_annotations = {}
     for node in graph.findall(f"{namespace}node"):
         attributes = {data.get("key"): data.text for data in node.findall(f"{namespace}data")}
+        label = attributes.get("d0")
+        if label not in PID_NODE_CLASSES:
+            raise ValueError(f"Unknown node label {label!r} in {graph_path}")
         xmin = attributes.get("d1", attributes.get("d5"))
         ymin = attributes.get("d2", attributes.get("d6"))
         xmax = attributes.get("d3", attributes.get("d7"))
@@ -280,28 +302,45 @@ def load_pid_graph(graph_path, width, height):
         if None in (xmin, ymin, xmax, ymax):
             raise ValueError(f"Node {node.get('id')} in {graph_path} has no bounding box")
 
-        node_centers[node.get("id")] = (
-            (float(xmin) + float(xmax)) / (2 * width),
-            (float(ymin) + float(ymax)) / (2 * height),
+        xmin, ymin, xmax, ymax = map(float, (xmin, ymin, xmax, ymax))
+        node_annotations[node.get("id")] = (
+            (
+                (xmin + xmax) / (2 * width),
+                (ymin + ymax) / (2 * height),
+                (xmax - xmin) / width,
+                (ymax - ymin) / height,
+            ),
+            PID_NODE_CLASSES[label],
         )
 
-    edge_pairs = set()
+    edge_annotations = {}
     for edge in graph.findall(f"{namespace}edge"):
         source, target = edge.get("source"), edge.get("target")
-        if source in node_centers and target in node_centers and source != target:
-            edge_pairs.add((source, target) if source < target else (target, source))
+        attributes = {data.get("key"): data.text for data in edge.findall(f"{namespace}data")}
+        label = attributes.get("d9")
+        if label not in PID_EDGE_CLASSES:
+            raise ValueError(f"Unknown edge label {label!r} in {graph_path}")
+        if source in node_annotations and target in node_annotations and source != target:
+            pair = (source, target) if source < target else (target, source)
+            edge_annotations[pair] = PID_EDGE_CLASSES[label]
 
-    if not edge_pairs:
+    if not edge_annotations:
         raise ValueError(f"Graph {graph_path} has no usable edges")
 
-    connected_ids = sorted({node_id for pair in edge_pairs for node_id in pair})
+    connected_ids = sorted({node_id for pair in edge_annotations for node_id in pair})
     node_indices = {node_id: index for index, node_id in enumerate(connected_ids)}
-    nodes = torch.tensor([node_centers[node_id] for node_id in connected_ids], dtype=torch.float32)
+    boxes = torch.tensor(
+        [node_annotations[node_id][0] for node_id in connected_ids], dtype=torch.float32
+    )
+    node_labels = torch.tensor(
+        [node_annotations[node_id][1] for node_id in connected_ids], dtype=torch.long
+    )
     edges = torch.tensor(
-        sorted((node_indices[source], node_indices[target]) for source, target in edge_pairs),
+        [(node_indices[source], node_indices[target]) for source, target in edge_annotations],
         dtype=torch.long,
     )
-    return nodes, edges
+    edge_labels = torch.tensor(list(edge_annotations.values()), dtype=torch.long)
+    return boxes, node_labels, edges, edge_labels
 
 
 def is_trainable_pid_graph(graph_path, max_nodes=None):
@@ -320,7 +359,13 @@ def is_trainable_pid_graph(graph_path, max_nodes=None):
             return False
         node_ids.add(node.get("id"))
 
-    if max_nodes is not None and len(node_ids) > max_nodes:
+    connected_ids = {
+        node_id
+        for edge in graph.findall(f"{namespace}edge")
+        for node_id in (edge.get("source"), edge.get("target"))
+        if node_id in node_ids
+    }
+    if max_nodes is not None and len(connected_ids) > max_nodes:
         return False
 
     return any(
@@ -333,10 +378,12 @@ def is_trainable_pid_graph(graph_path, max_nodes=None):
 
 def image_graph_collate_road_network(batch):
     images = torch.cat([item[0] for item in batch], 0).contiguous()
-    nodes = [item[1] for item in batch]
-    edges = [item[2] for item in batch]
-    ids = [item[3] for item in batch]
-    return [images, nodes, edges, ids]
+    boxes = [item[1] for item in batch]
+    node_labels = [item[2] for item in batch]
+    edges = [item[3] for item in batch]
+    edge_labels = [item[4] for item in batch]
+    ids = [item[5] for item in batch]
+    return [images, boxes, node_labels, edges, edge_labels, ids]
 
 
 def load_dataset(dataset_path):
@@ -428,8 +475,20 @@ def load_raw_images(ids, images_path):
 
 def build_road_network_data(config, mode="split"):
     if config.DATA.DATASET == "patched-pid-2D":
+        root_path = Path(config.DATA.DATA_PATH)
+        if (
+            mode == "split"
+            and (root_path / "dataset-metadata.json").is_file()
+            and not getattr(config.DATA, "ALLOW_BENCHMARK_TRAINING", False)
+        ):
+            raise RuntimeError(
+                "DATA_PATH points to the public PID2Graph benchmark. The paper uses this data "
+                "only for testing; set DATA_PATH to the unavailable Synthetic 700/real-world "
+                "training corpus, or explicitly set DATA.ALLOW_BENCHMARK_TRAINING=true for a "
+                "non-reproduction experiment."
+            )
         dataset_kwargs = {
-            "root_path": config.DATA.DATA_PATH,
+            "root_path": root_path,
             "image_size": config.DATA.IMG_SIZE,
             "split_seed": config.DATA.SEED,
             "max_nodes": config.MODEL.DECODER.OBJ_TOKEN,

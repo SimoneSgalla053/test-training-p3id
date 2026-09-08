@@ -1,7 +1,8 @@
 DATA:
   DIM: 2 # data dimension
-  BATCH_SIZE: 12 # per GPU; ~0.6 GB/img of activations at 512^2 with AMP -> fits a 15 GB T4
+  BATCH_SIZE: 20 # paper Appendix A2, on one 48 GB Quadro RTX 8000
   DATA_PATH: "./data/P&ID_imgs/PID2Graph/Patched" # Patched P&ID root only (never the Complete sheets)
+  ALLOW_BENCHMARK_TRAINING: false # prevents accidental leakage from the published test sets
   CACHE_DIR: null # preprocessed uint8 images + graphs; null = ~/.cache/relationformer (Kaggle: /kaggle/tmp)
   DATASET: "patched-pid-2D"
   IMG_SIZE: [512, 512] # Input image size
@@ -9,7 +10,8 @@ DATA:
   SEED: 10 # random seed for reproducibility
 
 MODEL:
-  NUM_CLASSES: 2 # Number of classes, overwritten in data preparation
+  NUM_CLASSES: 10 # 7 symbols plus crossing, connector/ankle and border
+  NUM_EDGE_CLASSES: 2 # solid and non-solid
 
   ENCODER:
     TYPE: deformable_transformer_backbone
@@ -56,7 +58,7 @@ MODEL:
     C_NODE: 5
 
 TRAIN:
-  EPOCHS: 30
+  EPOCHS: 80
   LR: 1e-4
   LR_BACKBONE: 3e-5
   WEIGHT_DECAY: 1e-4
@@ -91,5 +93,5 @@ INFERENCE:
   NMS: False # P&ID connectors sit ~10px from symbol centres; NMS would merge them
 
 log:
-  exp_name: "pid_reduced"
-  message: "Relationformer for the reduced patched P&ID line graph dataset"
+  exp_name: "pid_paper"
+  message: "Relationformer P&ID training with the DSAA 2025 paper hyperparameters"

@@ -15,6 +15,11 @@ parser.add_argument(
     "If None, use the nnU-Net config. See /config for examples.",
 )
 parser.add_argument("--resume", default=None, help="checkpoint of the last epoch of the model")
+parser.add_argument(
+    "--weights",
+    default=None,
+    help="checkpoint whose network weights initialize a new training phase",
+)
 parser.add_argument("--device", default="cuda", help="device to use for training")
 parser.add_argument(
     "--cuda_visible_device",
@@ -74,6 +79,10 @@ def main(args):
     from dataset_road_network import build_road_network_data
 
     config = load_config(args.config, verbose=True)
+    np.random.seed(config.DATA.SEED)
+    torch.manual_seed(config.DATA.SEED)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(config.DATA.SEED)
 
     # build index + preprocessing cache once here: doing it inside a rank would
     # leave the other ranks blocked on a collective past the NCCL timeout
@@ -104,6 +113,11 @@ def training(local_rank, args):
     world_size = idist.get_world_size()
     config = load_config(args.config, verbose=False)
     setup_logging(config, rank)
+    seed = config.DATA.SEED + rank
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
 
     torch.backends.cudnn.benchmark = True
     torch.backends.cudnn.enabled = True
@@ -116,6 +130,11 @@ def training(local_rank, args):
         print(f"world_size={world_size} amp={use_amp} device={device}")
 
     net = build_model(config).to(device)
+    if args.weights:
+        checkpoint = torch.load(args.weights, map_location="cpu")
+        net.load_state_dict(checkpoint["net"])
+        if rank == 0:
+            print(f"Initialized network weights from {args.weights}")
     if world_size > 1:
         # only rank 0 downloads pretrained weights; sync every rank to its init
         for tensor in itertools.chain(net.parameters(), net.buffers()):

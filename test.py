@@ -207,6 +207,7 @@ def test(args):
     from inference import relation_infer
     from metric_smd import StreetMoverDistance
     from metric_map import BBoxEvaluator
+    from metric_edge_map import EdgeMeanAveragePrecision
     from metric_topo.topo import compute_topo
     from box_ops_2D import box_cxcywh_to_xyxy_np
 
@@ -264,8 +265,18 @@ def test(args):
     metric_smd = StreetMoverDistance(eps=1e-5, max_iter=10, reduction="none")
     smd_results = []
 
+    symbol_classes = [
+        "general",
+        "tank",
+        "valve",
+        "instrumentation",
+        "pump",
+        "inlet/outlet",
+        "arrow",
+    ]
+    metric_symbol_map = BBoxEvaluator(symbol_classes, max_detections=100)
     metric_node_map = BBoxEvaluator(["node"], max_detections=100)
-    metric_edge_map = BBoxEvaluator(["edge"], max_detections=100)
+    metric_edge_map = EdgeMeanAveragePrecision(config.MODEL.NUM_EDGE_CLASSES)
 
     topo_results = []
     with torch.no_grad():
@@ -273,10 +284,13 @@ def test(args):
         for id_, batchdata in enumerate(tqdm(test_loader)):
 
             # extract data and put to device
-            images, nodes, edges = batchdata[0], batchdata[1], batchdata[2]
+            images, boxes, node_labels, edges, edge_labels = batchdata[:5]
             images = images.to(device, non_blocking=False)
-            nodes = [node.to(device, non_blocking=False) for node in nodes]
+            boxes = [box.to(device, non_blocking=False) for box in boxes]
+            nodes = [box[..., :2] for box in boxes]
+            node_labels = [label.to(device, non_blocking=False) for label in node_labels]
             edges = [edge.to(device, non_blocking=False) for edge in edges]
+            edge_labels = [label.to(device, non_blocking=False) for label in edge_labels]
 
             h, out = net(images)
             (
@@ -314,39 +328,63 @@ def test(args):
             ret = metric_smd(nodes, edges, pred_nodes, pred_edges)
             smd_results += ret.tolist()
 
-            # Add elements of current batch elem to node map evaluator
+            symbol_pred_boxes = []
+            symbol_pred_classes = []
+            symbol_pred_scores = []
+            symbol_gt_boxes = []
+            symbol_gt_classes = []
+            for predicted_boxes, predicted_classes, predicted_scores, target_boxes, target_classes in zip(
+                pred_nodes_box,
+                pred_nodes_box_class,
+                pred_nodes_box_score,
+                boxes,
+                node_labels,
+            ):
+                predicted_mask = predicted_classes <= len(symbol_classes)
+                target_mask = target_classes <= len(symbol_classes)
+                symbol_pred_boxes.append(box_cxcywh_to_xyxy_np(predicted_boxes[predicted_mask]))
+                symbol_pred_classes.append(predicted_classes[predicted_mask])
+                symbol_pred_scores.append(predicted_scores[predicted_mask])
+                symbol_gt_boxes.append(
+                    box_cxcywh_to_xyxy_np(target_boxes[target_mask].cpu().numpy())
+                )
+                symbol_gt_classes.append(target_classes[target_mask].cpu().numpy())
+            metric_symbol_map.add(
+                pred_boxes=symbol_pred_boxes,
+                pred_classes=symbol_pred_classes,
+                pred_scores=symbol_pred_scores,
+                gt_boxes=symbol_gt_boxes,
+                gt_classes=symbol_gt_classes,
+            )
+
             metric_node_map.add(
                 pred_boxes=[box_cxcywh_to_xyxy_np(box) for box in pred_nodes_box],
-                pred_classes=pred_nodes_box_class,
+                pred_classes=[np.ones(len(box), dtype=np.int64) for box in pred_nodes_box],
                 pred_scores=pred_nodes_box_score,
                 gt_boxes=[
-                    box_cxcywh_to_xyxy_np(
-                        np.concatenate(
-                            [nodes_.cpu().numpy(), np.ones_like(nodes_.cpu()) * 0.2], axis=1
-                        )
-                    )
-                    for nodes_ in nodes
+                    box_cxcywh_to_xyxy_np(boxes_.cpu().numpy()) for boxes_ in boxes
                 ],
-                gt_classes=[np.ones((nodes_.shape[0],)) for nodes_ in nodes],
+                gt_classes=[np.ones(len(box), dtype=np.int64) for box in boxes],
             )
 
-            # Add elements of current batch elem to edge map evaluator
-            pred_edges_box = [
-                edges_to_boxes(nodes_.cpu().numpy(), edges_)
-                for edges_, nodes_ in zip(pred_edges, pred_nodes)
-            ]
-            gt_edges_box = [
-                edges_to_boxes(nodes_.cpu().numpy(), edges_.cpu().numpy())
-                for edges_, nodes_ in zip(edges, nodes)
-            ]
-
-            metric_edge_map.add(
-                pred_boxes=pred_edges_box,
-                pred_classes=pred_edges_box_class,
-                pred_scores=pred_edges_box_score,
-                gt_boxes=gt_edges_box,
-                gt_classes=[np.ones((edges_.shape[0],)) for edges_ in edges],
-            )
+            for values in zip(
+                pred_nodes_box,
+                pred_edges,
+                pred_edges_box_score,
+                pred_edges_box_class,
+                boxes,
+                edges,
+                edge_labels,
+            ):
+                metric_edge_map.add(
+                    values[0],
+                    values[1],
+                    values[2],
+                    values[3],
+                    values[4].cpu().numpy(),
+                    values[5].cpu().numpy(),
+                    values[6].cpu().numpy(),
+                )
 
             for node_, edge_, pred_node_, pred_edge_ in zip(nodes, edges, pred_nodes, pred_edges):
                 topo_results.append(compute_topo(node_.cpu(), edge_.cpu(), pred_node_, pred_edge_))
@@ -356,7 +394,10 @@ def test(args):
     smd_std = torch.tensor(smd_results).std().item()
     print(f"smd value: mean {smd_mean}, std {smd_std}\n")
 
-    # Determine node box ap / ar
+    symbol_metric_scores = metric_symbol_map.eval()
+    print(f"symbol AP_IoU_0.50_MaxDet_100 {symbol_metric_scores['AP_IoU_0.50_MaxDet_100']}")
+
+    # Determine class-agnostic node box AP / AR
     node_metric_scores = metric_node_map.eval()
     print(
         f"node mAP_IoU_0.50_0.95_0.05_MaxDet_100 {node_metric_scores['mAP_IoU_0.50_0.95_0.05_MaxDet_100']}"
@@ -384,33 +425,9 @@ def test(args):
     print(f"node AR_IoU_0.80_MaxDet_100 {node_metric_scores['AR_IoU_0.80_MaxDet_100']}")
     print(f"node AR_IoU_0.90_MaxDet_100 {node_metric_scores['AR_IoU_0.90_MaxDet_100']}\n")
 
-    # Determine edge box ap / ar
-    edge_metric_scores = metric_edge_map.eval()
-    print(
-        f"edge mAP_IoU_0.50_0.95_0.05_MaxDet_100 {edge_metric_scores['mAP_IoU_0.50_0.95_0.05_MaxDet_100']}"
-    )
-    print(f"edge AP_IoU_0.10_MaxDet_100 {edge_metric_scores['AP_IoU_0.10_MaxDet_100']}")
-    print(f"edge AP_IoU_0.20_MaxDet_100 {edge_metric_scores['AP_IoU_0.20_MaxDet_100']}")
-    print(f"edge AP_IoU_0.30_MaxDet_100 {edge_metric_scores['AP_IoU_0.30_MaxDet_100']}")
-    print(f"edge AP_IoU_0.40_MaxDet_100 {edge_metric_scores['AP_IoU_0.40_MaxDet_100']}")
-    print(f"edge AP_IoU_0.50_MaxDet_100 {edge_metric_scores['AP_IoU_0.50_MaxDet_100']}")
-    print(f"edge AP_IoU_0.60_MaxDet_100 {edge_metric_scores['AP_IoU_0.60_MaxDet_100']}")
-    print(f"edge AP_IoU_0.70_MaxDet_100 {edge_metric_scores['AP_IoU_0.70_MaxDet_100']}")
-    print(f"edge AP_IoU_0.80_MaxDet_100 {edge_metric_scores['AP_IoU_0.80_MaxDet_100']}")
-    print(f"edge AP_IoU_0.90_MaxDet_100 {edge_metric_scores['AP_IoU_0.90_MaxDet_100']}\n")
-
-    print(
-        f"edge mAR_IoU_0.50_0.95_0.05_MaxDet_100 {edge_metric_scores['mAR_IoU_0.50_0.95_0.05_MaxDet_100']}"
-    )
-    print(f"edge AR_IoU_0.10_MaxDet_100 {edge_metric_scores['AR_IoU_0.10_MaxDet_100']}")
-    print(f"edge AR_IoU_0.20_MaxDet_100 {edge_metric_scores['AR_IoU_0.20_MaxDet_100']}")
-    print(f"edge AR_IoU_0.30_MaxDet_100 {edge_metric_scores['AR_IoU_0.30_MaxDet_100']}")
-    print(f"edge AR_IoU_0.40_MaxDet_100 {edge_metric_scores['AR_IoU_0.40_MaxDet_100']}")
-    print(f"edge AR_IoU_0.50_MaxDet_100 {edge_metric_scores['AR_IoU_0.50_MaxDet_100']}")
-    print(f"edge AR_IoU_0.60_MaxDet_100 {edge_metric_scores['AR_IoU_0.60_MaxDet_100']}")
-    print(f"edge AR_IoU_0.70_MaxDet_100 {edge_metric_scores['AR_IoU_0.70_MaxDet_100']}")
-    print(f"edge AR_IoU_0.80_MaxDet_100 {edge_metric_scores['AR_IoU_0.80_MaxDet_100']}")
-    print(f"edge AR_IoU_0.90_MaxDet_100 {edge_metric_scores['AR_IoU_0.90_MaxDet_100']}\n")
+    edge_map, edge_ap = metric_edge_map.compute()
+    print(f"edge mAP {edge_map}")
+    print(f"edge AP per class (solid, non-solid): {edge_ap}\n")
 
     # Determine topo
     print(np.array(topo_results).mean(axis=0))
