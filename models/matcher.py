@@ -50,8 +50,9 @@ class HungarianMatcher(nn.Module):
         cost_nodes = torch.cdist(out_nodes, tgt_nodes, p=1)
 
         # Compute the cls cost
-        tgt_ids = torch.cat([torch.tensor([1]*v.shape[0]).to(out_nodes.device) for v in targets['nodes']])
-        cost_class = -outputs["pred_logits"].flatten(0, 1).softmax(-1)[..., tgt_ids]
+        tgt_ids = torch.cat([v.to(out_nodes.device) for v in targets["node_classes"]])
+        out_prob = outputs["pred_logits"].flatten(0, 1).softmax(-1)
+        cost_class = -out_prob[:, tgt_ids]
 
         # Final cost matrix
         C = self.cost_nodes * cost_nodes + self.cost_class * cost_class

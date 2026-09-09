@@ -8,6 +8,8 @@ import numpy as np
 import networkx as nx
 import matplotlib.pyplot as plt
 
+from dataset_road_network import PID_EDGE_CLASS_TO_ID, PID_NODE_CLASS_TO_ID
+
 PROJECT_ROOT = Path(__file__).resolve().parent
 DEFAULT_CONFIG = PROJECT_ROOT / "configs" / "road_2D.yaml"
 
@@ -264,8 +266,16 @@ def test(args):
     metric_smd = StreetMoverDistance(eps=1e-5, max_iter=10, reduction="none")
     smd_results = []
 
-    metric_node_map = BBoxEvaluator(["node"], max_detections=100)
-    metric_edge_map = BBoxEvaluator(["edge"], max_detections=100)
+    node_class_names = [
+        class_name
+        for class_name, _ in sorted(PID_NODE_CLASS_TO_ID.items(), key=lambda item: item[1])
+    ]
+    edge_class_names = [
+        class_name
+        for class_name, _ in sorted(PID_EDGE_CLASS_TO_ID.items(), key=lambda item: item[1])
+    ]
+    metric_node_map = BBoxEvaluator(node_class_names, max_detections=100)
+    metric_edge_map = BBoxEvaluator(edge_class_names, max_detections=100)
 
     topo_results = []
     with torch.no_grad():
@@ -274,9 +284,18 @@ def test(args):
 
             # extract data and put to device
             images, nodes, edges = batchdata[0], batchdata[1], batchdata[2]
+            node_classes = batchdata[4] if len(batchdata) > 4 else None
+            edge_classes = batchdata[5] if len(batchdata) > 5 else None
+            node_boxes = batchdata[6] if len(batchdata) > 6 else None
             images = images.to(device, non_blocking=False)
             nodes = [node.to(device, non_blocking=False) for node in nodes]
             edges = [edge.to(device, non_blocking=False) for edge in edges]
+            if node_classes is not None:
+                node_classes = [node_class.to(device, non_blocking=False) for node_class in node_classes]
+            if edge_classes is not None:
+                edge_classes = [edge_class.to(device, non_blocking=False) for edge_class in edge_classes]
+            if node_boxes is not None:
+                node_boxes = [box.to(device, non_blocking=False) for box in node_boxes]
 
             h, out = net(images)
             (
@@ -321,13 +340,24 @@ def test(args):
                 pred_scores=pred_nodes_box_score,
                 gt_boxes=[
                     box_cxcywh_to_xyxy_np(
-                        np.concatenate(
+                        boxes_.cpu().numpy()
+                        if node_boxes is not None
+                        else np.concatenate(
                             [nodes_.cpu().numpy(), np.ones_like(nodes_.cpu()) * 0.2], axis=1
                         )
                     )
-                    for nodes_ in nodes
+                    for nodes_, boxes_ in zip(
+                        nodes,
+                        node_boxes if node_boxes is not None else [None] * len(nodes),
+                    )
                 ],
-                gt_classes=[np.ones((nodes_.shape[0],)) for nodes_ in nodes],
+                gt_classes=[
+                    node_class.cpu().numpy() if node_classes is not None else np.ones((nodes_.shape[0],))
+                    for nodes_, node_class in zip(
+                        nodes,
+                        node_classes if node_classes is not None else [None] * len(nodes),
+                    )
+                ],
             )
 
             # Add elements of current batch elem to edge map evaluator
@@ -345,7 +375,13 @@ def test(args):
                 pred_classes=pred_edges_box_class,
                 pred_scores=pred_edges_box_score,
                 gt_boxes=gt_edges_box,
-                gt_classes=[np.ones((edges_.shape[0],)) for edges_ in edges],
+                gt_classes=[
+                    edge_class.cpu().numpy() if edge_classes is not None else np.ones((edges_.shape[0],))
+                    for edges_, edge_class in zip(
+                        edges,
+                        edge_classes if edge_classes is not None else [None] * len(edges),
+                    )
+                ],
             )
 
             for node_, edge_, pred_node_, pred_edge_ in zip(nodes, edges, pred_nodes, pred_edges):

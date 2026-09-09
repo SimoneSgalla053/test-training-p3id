@@ -15,12 +15,20 @@ import torch.nn.functional as F
 from torch.autograd import Function
 from torch.autograd.function import once_differentiable
 
-import MultiScaleDeformableAttention as MSDA
+try:
+    import MultiScaleDeformableAttention as MSDA
+except ImportError:
+    MSDA = None
 
 
 class MSDeformAttnFunction(Function):
     @staticmethod
     def forward(ctx, value, value_spatial_shapes, value_level_start_index, sampling_locations, attention_weights, im2col_step):
+        if MSDA is None:
+            raise RuntimeError(
+                "The CUDA deformable-attention extension is unavailable. "
+                "Use ms_deform_attn_core_pytorch or compile models/ops."
+            )
         ctx.im2col_step = im2col_step
         output = MSDA.ms_deform_attn_forward(
             value, value_spatial_shapes, value_level_start_index, sampling_locations, attention_weights, ctx.im2col_step)

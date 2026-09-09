@@ -79,6 +79,9 @@ class RelationformerTrainer(SupervisedTrainer):
     def _iteration(self, engine, batchdata):
         images, nodes, edges = batchdata[0], batchdata[1], batchdata[2]
         ids = batchdata[3]
+        node_classes = batchdata[4] if len(batchdata) > 4 else None
+        edge_classes = batchdata[5] if len(batchdata) > 5 else None
+        node_boxes = batchdata[6] if len(batchdata) > 6 else None
 
         # inputs, targets = self.get_batch(batchdata, image_keys=IMAGE_KEYS, label_keys="label")
         # inputs = torch.cat(inputs, 1)
@@ -86,6 +89,12 @@ class RelationformerTrainer(SupervisedTrainer):
         nodes = [node.to(engine.state.device, non_blocking=True) for node in nodes]
         edges = [edge.to(engine.state.device, non_blocking=True) for edge in edges]
         target = {"nodes": nodes, "edges": edges}
+        if node_classes is not None:
+            target["node_classes"] = [labels.to(engine.state.device, non_blocking=True) for labels in node_classes]
+        if edge_classes is not None:
+            target["edge_classes"] = [labels.to(engine.state.device, non_blocking=True) for labels in edge_classes]
+        if node_boxes is not None:
+            target["boxes"] = [boxes.to(engine.state.device, non_blocking=True) for boxes in node_boxes]
 
         self.network.train()
         self.optimizer.zero_grad(set_to_none=True)

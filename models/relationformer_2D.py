@@ -39,23 +39,30 @@ class RelationFormer(nn.Module):
         self.aux_loss = config.MODEL.DECODER.AUX_LOSS
         self.with_box_refine = config.MODEL.DECODER.WITH_BOX_REFINE
         self.num_classes = config.MODEL.NUM_CLASSES
+        self.num_edge_classes = getattr(config.MODEL, "NUM_EDGE_CLASSES", 3)
 
         # ImageNet statistics expected by the pretrained ResNet backbone
         self.register_buffer("pixel_mean", torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1))
         self.register_buffer("pixel_std", torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1))
 
-        self.class_embed = nn.Linear(config.MODEL.DECODER.HIDDEN_DIM, 2)
+        self.class_embed = nn.Linear(config.MODEL.DECODER.HIDDEN_DIM, self.num_classes)
         self.bbox_embed = MLP(
             config.MODEL.DECODER.HIDDEN_DIM, config.MODEL.DECODER.HIDDEN_DIM, 4, 3
         )
 
         if config.MODEL.DECODER.RLN_TOKEN > 0:
             self.relation_embed = MLP(
-                config.MODEL.DECODER.HIDDEN_DIM * 3, config.MODEL.DECODER.HIDDEN_DIM, 2, 3
+                config.MODEL.DECODER.HIDDEN_DIM * 3,
+                config.MODEL.DECODER.HIDDEN_DIM,
+                self.num_edge_classes,
+                3,
             )
         else:
             self.relation_embed = MLP(
-                config.MODEL.DECODER.HIDDEN_DIM * 2, config.MODEL.DECODER.HIDDEN_DIM, 2, 3
+                config.MODEL.DECODER.HIDDEN_DIM * 2,
+                config.MODEL.DECODER.HIDDEN_DIM,
+                self.num_edge_classes,
+                3,
             )
 
         if not self.two_stage:
