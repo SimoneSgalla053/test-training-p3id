@@ -13,6 +13,7 @@ import random
 import yaml
 import json
 import hashlib
+import tempfile
 from multiprocessing import Pool
 from pathlib import Path
 from xml.etree import ElementTree
@@ -216,28 +217,51 @@ def _preprocess_pid_sample(job):
     nodes, edges, node_classes, edge_classes, node_boxes = load_pid_graph(
         graph_path, width, height
     )
-    return index, nodes, edges, node_classes, edge_classes, node_boxes
+    # Pool uses PyTorch's shared-memory reducers for CPU tensors. Keeping five
+    # tensors per sample in the parent also keeps five mmap storages alive and
+    # can exhaust mapping/IPC resources on large datasets. NumPy travels as
+    # ordinary pickle data; tensors are reconstructed in the parent heap.
+    return (index, *(tensor.numpy() for tensor in
+                     (nodes, edges, node_classes, edge_classes, node_boxes)))
 
 
 def preprocess_pid_samples(samples, image_size, cache_prefix, num_workers=None):
     """Decodes/resizes every image into a uint8 memmap and parses graphs to tensors, once.
 
-    Returns (images memmap [N, H, W], list of (nodes, edges)). The graphs pickle is written
-    last and doubles as the completion marker for the image memmap.
+    Returns images memmap [N, H, W] and five graph tensors per sample. Worker
+    results use NumPy instead of shared tensor storages. The graphs pickle is
+    published atomically last as the completion marker for the image memmap.
     """
+    global _WORKER_IMAGES
+    if num_workers is None:
+        num_workers = int(os.environ.get("RELATIONFORMER_PREPROCESS_WORKERS", min(4, os.cpu_count() or 1)))
+    if num_workers < 1:
+        raise ValueError("RELATIONFORMER_PREPROCESS_WORKERS must be at least 1")
     images_path = Path(f"{cache_prefix}_images.npy")
     graphs_path = Path(f"{cache_prefix}_graphs.pickle")
 
     if images_path.is_file() and graphs_path.is_file():
-        with open(graphs_path, "rb") as graphs_file:
-            graphs = pickle.load(graphs_file)
-        images = np.load(images_path, mmap_mode="r")
-        cache_is_compatible = all(
-            isinstance(sample, tuple) and len(sample) == 5 for sample in graphs
-        )
-        if images.shape[0] == len(graphs) == len(samples) and cache_is_compatible:
-            print(f"Loaded preprocessed P&ID samples from {cache_prefix}_*")
-            return images, graphs
+        try:
+            with open(graphs_path, "rb") as graphs_file:
+                graphs = pickle.load(graphs_file)
+            images = np.load(images_path, mmap_mode="r")
+            cache_is_compatible = all(
+                isinstance(sample, tuple) and len(sample) == 5 for sample in graphs
+            )
+            if (
+                images.shape == (len(samples), image_size[1], image_size[0])
+                and images.dtype == np.uint8
+                and len(graphs) == len(samples)
+                and cache_is_compatible
+            ):
+                print(f"Loaded preprocessed P&ID samples from {cache_prefix}_*")
+                return images, graphs
+            del images, graphs
+        except (EOFError, pickle.UnpicklingError, ValueError) as error:
+            print(f"Incomplete preprocessing cache, rebuilding: {error}")
+
+    # An old completion marker must not survive a failed rebuild of the images.
+    graphs_path.unlink(missing_ok=True)
 
     print(f"Preprocessing {len(samples)} P&ID samples into {cache_prefix}_* (first run)...")
     start_time = time.time()
@@ -254,22 +278,40 @@ def preprocess_pid_samples(samples, image_size, cache_prefix, num_workers=None):
         for index, (image_path, graph_path, _) in enumerate(samples)
     ]
     graphs = [None] * len(samples)
-    if num_workers is None:
-        num_workers = int(os.environ.get("RELATIONFORMER_PREPROCESS_WORKERS", min(4, os.cpu_count() or 1)))
-    if num_workers < 1:
-        raise ValueError("RELATIONFORMER_PREPROCESS_WORKERS must be at least 1")
-    with Pool(
-        num_workers, initializer=_init_pid_worker, initargs=(str(images_path), tuple(image_size))
-    ) as pool:
-        for done, (index, nodes, edges, node_classes, edge_classes, node_boxes) in enumerate(
-            pool.imap_unordered(_preprocess_pid_sample, jobs, chunksize=64), 1
-        ):
-            graphs[index] = (nodes, edges, node_classes, edge_classes, node_boxes)
-            if done % 5000 == 0:
-                print(f"  {done}/{len(samples)} samples preprocessed ({time.time() - start_time:.0f}s)")
 
-    with open(graphs_path, "wb") as graphs_file:
-        pickle.dump(graphs, graphs_file)
+    def collect(results):
+        for done, (index, *arrays) in enumerate(results, 1):
+            graphs[index] = tuple(torch.from_numpy(array) for array in arrays)
+            if done % 5000 == 0:
+                print(f"  {done}/{len(samples)} samples preprocessed ({time.time() - start_time:.0f}s)", flush=True)
+
+    print(f"Preprocessing workers={num_workers}; graph transport=NumPy (no shared tensor IPC)", flush=True)
+    if num_workers == 1:
+        _init_pid_worker(str(images_path), tuple(image_size))
+        try:
+            collect(map(_preprocess_pid_sample, jobs))
+        finally:
+            _WORKER_IMAGES.flush()
+            _WORKER_IMAGES = None
+    else:
+        with Pool(
+            num_workers, initializer=_init_pid_worker, initargs=(str(images_path), tuple(image_size))
+        ) as pool:
+            collect(pool.imap_unordered(_preprocess_pid_sample, jobs, chunksize=64))
+
+    images = np.load(images_path, mmap_mode="r+")
+    images.flush()
+    del images
+    temporary_path = None
+    try:
+        with tempfile.NamedTemporaryFile(mode="wb", dir=graphs_path.parent,
+                                         prefix=graphs_path.name + ".", suffix=".tmp", delete=False) as graphs_file:
+            temporary_path = Path(graphs_file.name)
+            pickle.dump(graphs, graphs_file, protocol=pickle.HIGHEST_PROTOCOL)
+        os.replace(temporary_path, graphs_path)
+    finally:
+        if temporary_path is not None:
+            temporary_path.unlink(missing_ok=True)
     print(f"Preprocessing done in {time.time() - start_time:.0f}s")
 
     return np.load(images_path, mmap_mode="r"), graphs

@@ -70,6 +70,12 @@ Set an optional resume checkpoint in the first code cell; only one training run 
 After editing runtime sources locally, refresh the embedded copy with
 `python3 scripts/update_kaggle_snapshot.py` before uploading the notebook again.
 
+If an older run fails during preprocessing with `rebuild_storage_fd: unable to mmap`,
+use the updated notebook in a fresh session. Workers now transfer NumPy arrays and the
+parent creates ordinary CPU tensors, avoiding one shared-memory mapping per graph tensor.
+`RELATIONFORMER_PREPROCESS_WORKERS=1` selects a fully serial fallback. Completed caches
+are reused; incomplete preprocessing caches are rebuilt.
+
 Select a GPU accelerator (dual T4 is supported), add the patched dataset as a Kaggle Dataset, and
 enable Internet for the initial ImageNet ResNet-101 weight download (or provide the weights in the
 torchvision cache). Run these cells from the repository root and keep Kaggle's preinstalled PyTorch

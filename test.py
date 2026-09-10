@@ -223,6 +223,7 @@ def test(args):
     if args.device == "cuda" and device.type != "cuda":
         print("CUDA is unavailable; testing on CPU.")
 
+    config.MODEL.ENCODER.PRETRAINED = False
     net = build_model(config).to(device)
 
     test_ds = build_road_network_data(config, mode="test")
@@ -249,7 +250,7 @@ def test(args):
             "No checkpoint found. Train the model first or pass --checkpoint PATH."
         )
     print(f"Loading checkpoint: {checkpoint_path}")
-    checkpoint = torch.load(checkpoint_path, map_location="cpu")
+    checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
     net.load_state_dict(checkpoint["net"])
     net.eval()
 
@@ -316,6 +317,7 @@ def test(args):
                 map_=True,
                 node_threshold=config.INFERENCE.NODE_THRESHOLD,
                 edge_threshold=config.INFERENCE.EDGE_THRESHOLD,
+                edge_chunk_size=getattr(config.INFERENCE, "EDGE_CHUNK_SIZE", 4096),
             )
 
             # Save visualization
