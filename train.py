@@ -2,6 +2,7 @@ import os
 import yaml
 import sys
 import json
+import random
 from argparse import ArgumentParser
 import numpy as np
 
@@ -105,6 +106,13 @@ def training(local_rank, args):
     config = load_config(args.config, verbose=False)
     setup_logging(config, rank)
 
+    seed = int(config.DATA.SEED) + rank
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
     torch.backends.cudnn.benchmark = True
     torch.backends.cudnn.enabled = True
     torch.multiprocessing.set_sharing_strategy("file_system")
@@ -115,6 +123,8 @@ def training(local_rank, args):
     if rank == 0:
         print(f"world_size={world_size} amp={use_amp} device={device}")
 
+    if args.resume:
+        config.MODEL.ENCODER.PRETRAINED = False
     net = build_model(config).to(device)
     if world_size > 1:
         # only rank 0 downloads pretrained weights; sync every rank to its init
@@ -190,7 +200,7 @@ def training(local_rank, args):
     )
 
     if args.resume:
-        checkpoint = torch.load(args.resume, map_location="cpu")
+        checkpoint = torch.load(args.resume, map_location="cpu", weights_only=True)
         net.load_state_dict(checkpoint["net"])
         optimizer.load_state_dict(checkpoint["optimizer"])
         scheduler.load_state_dict(checkpoint["scheduler"])

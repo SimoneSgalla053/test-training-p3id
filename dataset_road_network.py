@@ -254,7 +254,10 @@ def preprocess_pid_samples(samples, image_size, cache_prefix, num_workers=None):
         for index, (image_path, graph_path, _) in enumerate(samples)
     ]
     graphs = [None] * len(samples)
-    num_workers = num_workers or os.cpu_count() or 1
+    if num_workers is None:
+        num_workers = int(os.environ.get("RELATIONFORMER_PREPROCESS_WORKERS", min(4, os.cpu_count() or 1)))
+    if num_workers < 1:
+        raise ValueError("RELATIONFORMER_PREPROCESS_WORKERS must be at least 1")
     with Pool(
         num_workers, initializer=_init_pid_worker, initargs=(str(images_path), tuple(image_size))
     ) as pool:

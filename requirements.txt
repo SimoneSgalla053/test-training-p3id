@@ -1,3 +1,4 @@
+# Historical environment only. For Python 3.12 / WSL use requirements-wsl.txt and the guide.
 --extra-index-url https://download.pytorch.org/whl/cu113
  
 torch==1.10.0+cu113

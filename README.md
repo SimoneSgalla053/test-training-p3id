@@ -1,20 +1,21 @@
 # Relationformer: A Unified Framework for Image-to-Graph Generation
 
 ## Requirements
-* CUDA>=9.2
-* PyTorch>=1.7.1
+For the code in this checkout, use the modern environment described in
+[Analisi del codice e guida WSL (Italiano)](ANALISI_TRAINING_WSL.md).
+It includes the paper comparison, applied fixes, test results, and instructions for an RTX A1000 6 GB.
+`requirements.txt` is retained as the historical environment, not the installation path for Python 3.12.
 
-For other system requirements please follow
+For local WSL, install the matching PyTorch wheels first, then the tested dependencies:
 
 ```bash
-pip install -r requirements.txt
+python -m pip install torch==2.7.1 torchvision==0.22.1 --index-url https://download.pytorch.org/whl/cu128
+python -m pip install -r requirements-wsl.txt
 ```
 
-### Compiling CUDA operators
-```bash
-cd ./models/ops
-python setup.py install
-```
+The active attention implementation uses PyTorch `grid_sample` and activation checkpointing.
+No CUDA extension build or local CUDA Toolkit is required for this path. Compiling `models/ops`
+alone does not select the native extension.
 
 
 ## Code Usage
@@ -33,7 +34,9 @@ code_root/
         └── PID2Graph Synthetic/
 ```
 
-Samples are split deterministically by their source drawing directory: 80% training, 10% validation, and 10% test. The loader converts GraphML node bounding boxes to normalized center points and uses GraphML edges as graph targets.
+Samples from the configured training sources are split by a hash of their source drawing directory:
+approximately 95% training and 5% validation, with OPEN100 held out for testing.
+The loader reads normalized centers, bounding boxes, node classes, edges, and edge classes from GraphML.
 
 If you want strict paper-style annotation normalization (canonical GraphML keys + class mapping) and an image-consistency check, run:
 
@@ -41,7 +44,7 @@ If you want strict paper-style annotation normalization (canonical GraphML keys 
 python prepare_pid2graph_paper_dataset.py \
   --source-root data/PID2Graph/Patched \
   --output-root data/PID2Graph/Patched_paper \
-  --compare-root data/P&ID_imgs/PID2Graph/Patched \
+  --compare-root 'data/P&ID_imgs/PID2Graph/Patched' \
   --copy-images
 ```
 
@@ -59,6 +62,13 @@ an independent result on `PID2Graph Synthetic`. The available training sources c
 without adding the unpublished training data or contaminating the held-out OPEN100 evaluation.
 
 ## Kaggle setup
+
+For **Run All**, upload `kaggle_train_relationformer.ipynb` to Kaggle, select two GPUs,
+attach the patched dataset, and enable Internet. It includes the current Python sources:
+no clone or push is needed. Defaults are batch 4 per GPU, AMP, and at most 9 training hours.
+Set an optional resume checkpoint in the first code cell; only one training run is launched.
+After editing runtime sources locally, refresh the embedded copy with
+`python3 scripts/update_kaggle_snapshot.py` before uploading the notebook again.
 
 Select a GPU accelerator (dual T4 is supported), add the patched dataset as a Kaggle Dataset, and
 enable Internet for the initial ImageNet ResNet-101 weight download (or provide the weights in the
@@ -100,14 +110,14 @@ python train.py --config configs/road_2D.yaml --cuda_visible_device 0 1 \
 
 #### 2.1 Prepare config file
 
-The config file can be found at `.configs/road_2D.yaml`. Make custom changes if necessary.
+The Kaggle config is `configs/road_2D.yaml`; the local starting config is `configs/wsl_2D.yaml`.
 
 #### 2.2 Train
 
 For example, the command for training Relationformer is following:
 
 ```bash
-python train.py --config configs/road_2D.yaml --cuda_visible_device 3
+python train.py --config configs/wsl_2D.yaml --cuda_visible_device 0
 ```
 
 ## 3. Evaluation
@@ -115,5 +125,5 @@ python train.py --config configs/road_2D.yaml --cuda_visible_device 3
 Once you have the config file and trained model, run following command to evaluate it on test set:
 
 ```bash
-python test.py --config configs/road_2D.yaml --cuda_visible_device 3 --checkpoint ./trained_weights/last_checkpoint.pt
+python test.py --config configs/wsl_2D.yaml --cuda_visible_device 0 --checkpoint /path/to/checkpoint.pt
 ```

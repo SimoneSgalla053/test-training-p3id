@@ -96,11 +96,12 @@ class Backbone(BackboneBase):
     def __init__(self, name: str,
                  train_backbone: bool,
                  return_interm_layers: bool,
-                 dilation: bool):
+                 dilation: bool,
+                 pretrained: bool = True):
         norm_layer = FrozenBatchNorm2d
         backbone_builder = getattr(torchvision.models, name)
         try:
-            weights = "DEFAULT" if is_main_process() else None
+            weights = "DEFAULT" if pretrained and is_main_process() else None
             backbone = backbone_builder(
                 replace_stride_with_dilation=[False, False, dilation],
                 weights=weights,
@@ -109,7 +110,7 @@ class Backbone(BackboneBase):
         except TypeError:
             backbone = backbone_builder(
                 replace_stride_with_dilation=[False, False, dilation],
-                pretrained=is_main_process(),
+                pretrained=pretrained and is_main_process(),
                 norm_layer=norm_layer,
             )
         assert name not in ('resnet18', 'resnet34'), "number of channels are hard coded"
@@ -144,7 +145,8 @@ def build_backbone(config):
     return_interm_layers = config.MODEL.ENCODER.MASKS or (config.MODEL.ENCODER.NUM_FEATURE_LEVELS > 1)
     backbone = Backbone(
         config.MODEL.ENCODER.BACKBONE, train_backbone, return_interm_layers, 
-        config.MODEL.ENCODER.DILATION
+        config.MODEL.ENCODER.DILATION,
+        pretrained=getattr(config.MODEL.ENCODER, "PRETRAINED", True),
     )
     model = Joiner(backbone, position_embedding)
     return model

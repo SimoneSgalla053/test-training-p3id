@@ -8,3 +8,8 @@ scipy>=1.10
 matplotlib>=3.7
 tqdm>=4.65
 tensorboard>=2.12
+# Used by test.py and its topology metrics (not only training).
+networkx>=3.0,<4
+Rtree>=1.0,<2
+svgwrite>=1.4,<2
+hopcroftkarp==1.2.5

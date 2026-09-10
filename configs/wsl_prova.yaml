@@ -1,0 +1,99 @@
+# WSL RTX A1000 6 GB: start at batch 1; benchmark before increasing.
+DATA:
+  DIM: 2
+  BATCH_SIZE: 1
+  DATA_PATH: ./data/PID2Graph/Patched
+  CACHE_DIR: null
+  DATASET: patched-pid-2D
+  IMG_SIZE:
+  - 512
+  - 512
+  NUM_WORKERS: 0
+  SEED: 10
+  TRAIN_SOURCES:
+  - Dataset PID
+  - PID2Graph Synthetic
+  TEST_SOURCES:
+  - PID2Graph OPEN100
+  VALIDATION_PERCENT: 5
+MODEL:
+  NUM_CLASSES: 11
+  NUM_EDGE_CLASSES: 3
+  ENCODER:
+    TYPE: deformable_transformer_backbone
+    NAME: deformable_transformer_backbone
+    HIDDEN_DIM: 256
+    POSITION_EMBEDDING: sine
+    LR_BACKBONE: 3e-5
+    NUM_FEATURE_LEVELS: 4
+    BACKBONE: resnet101
+    MASKS: false
+    DILATION: false
+    IN_CHANS: 1
+    DEPTHS:
+    - 4
+    - 4
+    - 8
+    - 8
+  DECODER:
+    TYPE: deformable_transformer
+    NAME: deformable_transformer
+    HIDDEN_DIM: 256
+    NHEADS: 8
+    ENC_LAYERS: 4
+    DEC_LAYERS: 4
+    DIM_FEEDFORWARD: 512
+    DROPOUT: 0.1
+    ACTIVATION: relu
+    NUM_FEATURE_LEVELS: 4
+    DEC_N_POINTS: 4
+    ENC_N_POINTS: 4
+    TWO_STAGE: false
+    AUX_LOSS: false
+    WITH_BOX_REFINE: false
+    OBJ_TOKEN: 400
+    RLN_TOKEN: 1
+    DUMMY_TOKEN: 0
+    RLN_ATTN: true
+  MATCHER:
+    C_CLASS: 2
+    C_NODE: 5
+TRAIN:
+  EPOCHS: 1
+  LR: 1e-4
+  LR_BACKBONE: 3e-5
+  WEIGHT_DECAY: 1e-4
+  LR_DROP: 60
+  CLIP_MAX_NORM: 0.1
+  AMP: true
+  SAVE_PATH: ./trained_weights/
+  VAL_INTERVAL: 1
+  SAVE_VAL: false
+  LOG_INTERVAL: 10
+  EARLY_STOPPING_PATIENCE: 10
+  EARLY_STOPPING_MIN_DELTA: 0.0
+  MAX_HOURS: null
+  LOSSES:
+  - boxes
+  - class
+  - cards
+  - nodes
+  - edges
+  W_BBOX: 2.0
+  W_CLASS: 2.0
+  W_CARD: 1.0
+  W_NODE: 4.0
+  W_EDGE: 3.0
+  RANDOMIZE_EDGE_DIRECTIONS: true
+  MAX_POS_EDGES: null
+  NEG_EDGE_RATIO: 4
+  MIN_NEG_EDGES: 20
+INFERENCE:
+  NODE_THRESHOLD: 0.6
+  EDGE_THRESHOLD: 0.75
+  NMS: false
+  EDGE_CHUNK_SIZE: 2048
+log:
+  exp_name: pid2graph_wsl_prova
+  message: Local WSL baseline for RTX A1000 6 GB; available-data experiment, not exact
+    paper replication

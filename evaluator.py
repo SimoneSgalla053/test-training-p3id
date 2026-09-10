@@ -1,4 +1,5 @@
 import os
+import operator
 from pathlib import Path
 import matplotlib.pyplot as plt
 import numpy as np
@@ -110,6 +111,7 @@ class RelationformerEvaluator(SupervisedEvaluator):
                 nms=getattr(self.config.INFERENCE, "NMS", False),
                 node_threshold=self.config.INFERENCE.NODE_THRESHOLD,
                 edge_threshold=self.config.INFERENCE.EDGE_THRESHOLD,
+                edge_chunk_size=getattr(self.config.INFERENCE, "EDGE_CHUNK_SIZE", 4096),
             )
 
         if (
@@ -188,6 +190,7 @@ def build_evaluator(val_loader, net, optimizer, scheduler, scaler, writer, confi
             )
         },
         val_handlers=val_handlers,
+        metric_cmp_fn=operator.lt,
         amp=False,
     )
 

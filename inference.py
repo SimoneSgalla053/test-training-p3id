@@ -1,158 +1,86 @@
+"""Convert object/relation tokens into an undirected graph."""
+
+import numpy as np
 import torch
-import torch.nn.functional as F
 from torchvision.ops import batched_nms
-import itertools
+
+from box_ops_2D import box_cxcywh_to_xyxy
 
 
+@torch.no_grad()
 def relation_infer(
-    h,
-    out,
-    model,
-    obj_token,
-    rln_token,
-    nms=False,
-    map_=False,
-    node_threshold=0.5,
-    edge_threshold=0.5,
+    h, out, model, obj_token, rln_token, nms=False, map_=False,
+    node_threshold=0.5, edge_threshold=0.5, edge_chunk_size=4096,
 ):
-    # all token except the last one is object token
+    """Score all unordered pairs with bounded relation-head memory.
+
+    Preserve the mean-of-two-direction-logits rule and output ordering.
+    Boxes use normalized (cx, cy, width, height); edges index the kept nodes.
+    """
+    if not 0 <= node_threshold <= 1 or not 0 <= edge_threshold <= 1:
+        raise ValueError("Node and edge thresholds must lie in [0, 1]")
+    if edge_chunk_size < 1:
+        raise ValueError("edge_chunk_size must be positive")
+    if rln_token not in (0, 1):
+        raise ValueError("The relation head supports zero or one relation token")
+
     object_token = h[..., :obj_token, :]
-
-    # last token is relation token
-    if rln_token > 0:
-        relation_token = h[..., obj_token : obj_token + rln_token, :]
-
-    # Keep nodes only when the best non-background class clears the threshold.
-    node_probs = out["pred_logits"].softmax(-1).detach()
+    node_probs = out["pred_logits"].softmax(-1)
     node_scores, node_classes = node_probs[..., 1:].max(-1)
     node_classes = node_classes + 1
     valid_token = node_scores >= node_threshold
 
-    # apply nms on valid tokens
-    if nms:
-        valid_token_nms = torch.zeros_like(valid_token)
-        for idx, (token, logits, nodes) in enumerate(
-            zip(valid_token, out["pred_logits"], out["pred_nodes"])
-        ):
-            valid_token_id = torch.nonzero(token).squeeze(1)
-
-            valid_logits, valid_nodes = logits[valid_token_id], nodes[valid_token_id]
-            valid_scores = F.softmax(valid_logits, dim=1)[:, 1:].max(-1).values
-
-            # 0 <= x1 < x2 and 0 <= y1 < y2 has to be fulfilled
-            valid_nodes[:, 2:] = valid_nodes[:, :2] + 0.5
-
-            ids2keep = batched_nms(
-                boxes=valid_nodes * 1000,
-                scores=valid_scores,
-                idxs=torch.ones_like(valid_scores, dtype=torch.long),
+    pred_nodes, pred_edges = [], []
+    boxes, scores, classes, edge_scores_out, edge_classes_out = [], [], [], [], []
+    for batch_id in range(h.shape[0]):
+        node_id = torch.nonzero(valid_token[batch_id]).squeeze(1)
+        if nms and node_id.numel():
+            kept = batched_nms(
+                box_cxcywh_to_xyxy(out["pred_nodes"][batch_id, node_id].float()),
+                node_scores[batch_id, node_id].float(),
+                node_classes[batch_id, node_id],
                 iou_threshold=0.90,
             )
-            valid_token_id_nms = valid_token_id[ids2keep].sort()[0]
-            # print(valid_nodes.shape[0] - ids2keep.shape[0])
+            node_id = node_id[kept].sort().values
 
-            valid_token_nms[idx][valid_token_id_nms] = 1
-        valid_token = valid_token_nms
-
-    pred_nodes = []
-    pred_edges = []
-    if map_:
-        pred_nodes_boxes = []
-        pred_nodes_boxes_score = []
-        pred_nodes_boxes_class = []
-
-        pred_edges_boxes_score = []
-        pred_edges_boxes_class = []
-
-    for batch_id in range(h.shape[0]):
-
-        # ID of the valid tokens
-        node_id = torch.nonzero(valid_token[batch_id]).squeeze(1)
-
-        # coordinates of the valid tokens
         pred_nodes.append(out["pred_nodes"][batch_id, node_id, :2].detach())
-
         if map_:
-            pred_nodes_boxes.append(out["pred_nodes"][batch_id, node_id, :].detach().cpu().numpy())
-            pred_nodes_boxes_score.append(
-                node_scores[batch_id, node_id].detach().cpu().numpy()
+            boxes.append(out["pred_nodes"][batch_id, node_id].detach().cpu().numpy())
+            scores.append(node_scores[batch_id, node_id].cpu().numpy())
+            classes.append(node_classes[batch_id, node_id].cpu().numpy())
+
+        pairs = torch.triu_indices(len(node_id), len(node_id), offset=1, device=h.device).T
+        kept_edges, kept_scores, kept_classes = [], [], []
+        for chunk in pairs.split(edge_chunk_size):
+            if not len(chunk):
+                continue
+            first = object_token[batch_id, node_id[chunk[:, 0]]]
+            second = object_token[batch_id, node_id[chunk[:, 1]]]
+            forward_parts, reverse_parts = [first, second], [second, first]
+            if rln_token:
+                relation = h[batch_id, obj_token:obj_token + 1].expand(len(chunk), -1)
+                forward_parts.append(relation)
+                reverse_parts.append(relation)
+            logits = model.relation_embed(torch.cat(forward_parts, dim=1))
+            reverse_logits = model.relation_embed(torch.cat(reverse_parts, dim=1))
+            probabilities = ((logits + reverse_logits) / 2.0).softmax(-1)
+            edge_scores, edge_classes = probabilities[:, 1:].max(-1)
+            keep = edge_scores >= edge_threshold
+            kept_edges.append(chunk[keep].cpu())
+            kept_scores.append(edge_scores[keep].cpu())
+            kept_classes.append((edge_classes[keep] + 1).cpu())
+
+        pred_edges.append(
+            torch.cat(kept_edges).numpy() if kept_edges else np.empty((0, 2), dtype=np.int64)
+        )
+        if map_:
+            edge_scores_out.append(
+                torch.cat(kept_scores).numpy() if kept_scores else np.empty(0, dtype=np.float32)
             )
-            pred_nodes_boxes_class.append(node_classes[batch_id, node_id].long().cpu().numpy())
-
-        if node_id.dim() != 0 and node_id.nelement() != 0 and node_id.shape[0] > 1:
-
-            # all possible node pairs in all token ordering
-            node_pairs = [list(i) for i in list(itertools.combinations(list(node_id), 2))]
-            node_pairs = list(map(list, zip(*node_pairs)))
-
-            # node pairs in valid token order
-            node_pairs_valid = torch.tensor(
-                [list(i) for i in list(itertools.combinations(list(range(len(node_id))), 2))]
+            edge_classes_out.append(
+                torch.cat(kept_classes).numpy() if kept_classes else np.empty(0, dtype=np.int64)
             )
-
-            # concatenate valid object pairs relation feature
-            if rln_token > 0:
-                relation_feature1 = torch.cat(
-                    (
-                        object_token[batch_id, node_pairs[0], :],
-                        object_token[batch_id, node_pairs[1], :],
-                        relation_token[batch_id, ...].repeat(len(node_pairs_valid), 1),
-                    ),
-                    1,
-                )
-                relation_feature2 = torch.cat(
-                    (
-                        object_token[batch_id, node_pairs[1], :],
-                        object_token[batch_id, node_pairs[0], :],
-                        relation_token[batch_id, ...].repeat(len(node_pairs_valid), 1),
-                    ),
-                    1,
-                )
-            else:
-                relation_feature1 = torch.cat(
-                    (
-                        object_token[batch_id, node_pairs[0], :],
-                        object_token[batch_id, node_pairs[1], :],
-                    ),
-                    1,
-                )
-                relation_feature2 = torch.cat(
-                    (
-                        object_token[batch_id, node_pairs[1], :],
-                        object_token[batch_id, node_pairs[0], :],
-                    ),
-                    1,
-                )
-
-            relation_pred1 = model.relation_embed(relation_feature1).detach()
-            relation_pred2 = model.relation_embed(relation_feature2).detach()
-            relation_pred = (relation_pred1 + relation_pred2) / 2.0
-
-            relation_probs = relation_pred.softmax(-1)
-            edge_scores, edge_classes = relation_probs[:, 1:].max(-1)
-            edge_classes = edge_classes + 1
-            pred_rel = torch.nonzero(edge_scores >= edge_threshold).squeeze(1).cpu().numpy()
-            pred_edges.append(node_pairs_valid[pred_rel].cpu().numpy())
-
-            if map_:
-                pred_edges_boxes_score.append(edge_scores[pred_rel].cpu().numpy())
-                pred_edges_boxes_class.append(edge_classes[pred_rel].long().cpu().numpy())
-        else:
-            pred_edges.append(torch.empty(0, 2))
-
-            if map_:
-                pred_edges_boxes_score.append(torch.empty(0, 1))
-                pred_edges_boxes_class.append(torch.empty(0, 1))
 
     if map_:
-        return (
-            pred_nodes,
-            pred_edges,
-            pred_nodes_boxes,
-            pred_nodes_boxes_score,
-            pred_nodes_boxes_class,
-            pred_edges_boxes_score,
-            pred_edges_boxes_class,
-        )
-    else:
-        return pred_nodes, pred_edges
+        return pred_nodes, pred_edges, boxes, scores, classes, edge_scores_out, edge_classes_out
+    return pred_nodes, pred_edges

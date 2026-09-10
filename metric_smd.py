@@ -30,12 +30,13 @@ class MeanSMD(Metric):
     Computes Dice score metric from full size Tensor and collects average over batch, class-channels, iterations.
     """
     def __init__(
-        self, output_transform: Callable = lambda x: x) -> None:
+        self, output_transform: Callable = lambda x: x, save_details: bool = False) -> None:
         """[summary]
 
         Args:
             output_transform (Callable, optional): [description]. Defaults to lambdax:x.
         """        ''''''
+        self.save_details = save_details
         self.metric_fn = StreetMoverDistance(eps=1e-7, max_iter=100, reduction=MetricReduction.MEAN)
         super().__init__(output_transform=output_transform,)
 

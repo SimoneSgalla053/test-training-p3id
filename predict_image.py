@@ -12,6 +12,7 @@ import yaml
 
 from inference import relation_infer
 from models import build_model
+from dataset_road_network import PID_NODE_CLASS_TO_ID, PID_EDGE_CLASS_TO_ID
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent
@@ -25,6 +26,7 @@ parser.add_argument("--output-dir", type=Path, default=PROJECT_ROOT / "trained_w
 parser.add_argument("--device", choices=("cuda", "cpu"), default="cuda")
 parser.add_argument("--node-threshold", type=float, default=None)
 parser.add_argument("--edge-threshold", type=float, default=None)
+parser.add_argument("--edge-chunk-size", type=int, default=None)
 
 
 class ConfigObject:
@@ -83,17 +85,22 @@ def main(args):
     if args.device == "cuda" and device.type != "cuda":
         print("CUDA is unavailable; running on CPU.")
 
+    config.MODEL.ENCODER.PRETRAINED = False
     model = build_model(config).to(device)
-    checkpoint = torch.load(args.checkpoint, map_location="cpu")
+    checkpoint = torch.load(args.checkpoint, map_location="cpu", weights_only=True)
     model.load_state_dict(checkpoint["net"])
     model.eval()
 
     image, original_size = load_image(args.image, config.DATA.IMG_SIZE)
-    node_threshold = args.node_threshold or config.INFERENCE.NODE_THRESHOLD
-    edge_threshold = args.edge_threshold or config.INFERENCE.EDGE_THRESHOLD
-    with torch.no_grad():
+    node_threshold = config.INFERENCE.NODE_THRESHOLD if args.node_threshold is None else args.node_threshold
+    edge_threshold = config.INFERENCE.EDGE_THRESHOLD if args.edge_threshold is None else args.edge_threshold
+    edge_chunk_size = (
+        getattr(config.INFERENCE, "EDGE_CHUNK_SIZE", 4096)
+        if args.edge_chunk_size is None else args.edge_chunk_size
+    )
+    with torch.inference_mode():
         hidden, output = model(image.to(device))
-        predicted_nodes, predicted_edges = relation_infer(
+        predicted_nodes, predicted_edges, boxes, scores, classes, edge_scores, edge_classes = relation_infer(
             hidden,
             output,
             model,
@@ -102,6 +109,8 @@ def main(args):
             nms=config.INFERENCE.NMS,
             node_threshold=node_threshold,
             edge_threshold=edge_threshold,
+            edge_chunk_size=edge_chunk_size,
+            map_=True,
         )
 
     nodes = predicted_nodes[0].cpu().tolist()
@@ -117,6 +126,15 @@ def main(args):
                 "original_size": {"width": original_size[0], "height": original_size[1]},
                 "nodes": nodes,
                 "edges": edges,
+                "node_boxes_cxcywh": boxes[0].tolist(),
+                "node_scores": scores[0].tolist(),
+                "node_classes": classes[0].tolist(),
+                "edge_scores": edge_scores[0].tolist(),
+                "edge_classes": edge_classes[0].tolist(),
+                "node_class_to_id": PID_NODE_CLASS_TO_ID,
+                "edge_class_to_id": PID_EDGE_CLASS_TO_ID,
+                "coordinate_system": "normalized_xy; boxes are cx, cy, width, height",
+                "thresholds": {"node": node_threshold, "edge": edge_threshold},
             },
             graph_file,
             indent=2,

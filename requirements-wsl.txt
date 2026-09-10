@@ -1,0 +1,18 @@
+# Python 3.12. Install the matching torch/torchvision wheels first (see ANALISI_TRAINING_WSL.md).
+# A tested baseline, not a claim that these are the newest releases.
+torch==2.7.1
+torchvision==0.22.1
+numpy==2.2.6
+monai==1.5.1
+pytorch-ignite==0.5.2
+tensorboardX==2.6.4
+PyYAML==6.0.2
+Pillow==11.3.0
+scipy==1.16.1
+matplotlib==3.10.5
+tqdm==4.67.1
+tensorboard==2.20.0
+networkx==3.5
+Rtree==1.4.1
+svgwrite==1.4.3
+hopcroftkarp==1.2.5
